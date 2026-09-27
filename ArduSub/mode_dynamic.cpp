@@ -19,6 +19,9 @@
  *   position control stays correct while the vehicle is rolled or pitched.
  * - With DYN_BT_ENABLE set, the downward rangefinder is used to hold range
  *   above the seafloor (bottom tracking) instead of a fixed depth.
+ * - MAV_CMD_MISSION_START flies the uploaded mission's waypoints (e.g. a
+ *   lawnmower survey) with AC_WPNav, keeping the roll/pitch hold, then holds at
+ *   the last waypoint. Any position/velocity command stops the path.
  */
 
 // initialise dynamic mode
@@ -48,6 +51,8 @@ bool ModeDynamic::init(bool ignore_checks)
 // initialise the position controllers and hold at the stopping point
 void ModeDynamic::init_controllers()
 {
+    path_running = false;
+
     position_control->NE_set_max_speed_accel_cm(sub.wp_nav.get_default_speed_NE_cms(), sub.wp_nav.get_wp_acceleration_cmss());
     position_control->NE_set_correction_speed_accel_cm(sub.wp_nav.get_default_speed_NE_cms(), sub.wp_nav.get_wp_acceleration_cmss());
     position_control->D_set_max_speed_accel_cm(sub.wp_nav.get_default_speed_down_cms(), sub.wp_nav.get_default_speed_up_cms(), sub.wp_nav.get_accel_D_cmss());
@@ -78,6 +83,9 @@ bool ModeDynamic::timed_out(uint32_t update_ms, uint32_t now_ms, uint32_t timeou
 
 void ModeDynamic::set_horizontal_target(SubMode submode, const Vector2p& pos_ne_m, const Vector2f& vel_ne_ms)
 {
+    if (path_running) {
+        stop_path("new command");
+    }
     horiz_submode = submode;
     pos_target_ne_m = pos_ne_m;
     vel_target_ne_ms = vel_ne_ms;
@@ -87,6 +95,9 @@ void ModeDynamic::set_horizontal_target(SubMode submode, const Vector2p& pos_ne_
 // pos_d_m is relative to the bottom tracking offset (if any)
 void ModeDynamic::set_vertical_target(SubMode submode, float pos_d_m, float vel_d_ms)
 {
+    if (path_running) {
+        stop_path("new command");
+    }
     vert_submode = submode;
     pos_target_d_m = pos_d_m;
     vel_target_d_ms = vel_d_ms;
@@ -295,8 +306,12 @@ void ModeDynamic::run()
     const uint32_t now_ms = AP_HAL::millis();
     const uint32_t timeout_ms = MAX(g2.dyn_timeout.get(), 0.1f) * 1000;
 
-    update_horizontal(now_ms, timeout_ms);
-    update_vertical(now_ms, timeout_ms);
+    if (path_running) {
+        run_path();
+    } else {
+        update_horizontal(now_ms, timeout_ms);
+        update_vertical(now_ms, timeout_ms);
+    }
 
     // roll and pitch: commanded target plus pilot input
     if (is_positive(g2.dyn_att_timeout) && timed_out(att_update_ms, now_ms, g2.dyn_att_timeout * 1000)) {
@@ -437,6 +452,170 @@ void ModeDynamic::update_vertical(uint32_t now_ms, uint32_t timeout_ms)
     }
 
     position_control->D_update_controller();
+}
+
+/*
+ * Path following. Waypoints are read from the uploaded mission (the same
+ * storage AUTO uses) and flown one leg at a time with AC_WPNav, stopping at
+ * each waypoint so survey lines stay straight. Supported items:
+ *   NAV_WAYPOINT / NAV_SPLINE_WAYPOINT / NAV_LOITER_TIME (param1 = hold seconds)
+ *   NAV_LOITER_UNLIM (go there and finish), DO_CHANGE_SPEED, CONDITION_YAW.
+ * Waypoints with an above-terrain altitude follow the seafloor using the
+ * downward rangefinder (WPNAV_RFND_USE). The last waypoint is held afterwards.
+ */
+bool ModeDynamic::start_path(uint16_t first_index)
+{
+    if (!motors.armed()) {
+        gcs().send_text(MAV_SEVERITY_WARNING, "Dynamic: arm before starting a path");
+        return false;
+    }
+    const uint16_t num_cmds = sub.mission.num_commands();
+    // index 0 is home
+    first_index = MAX(first_index, 1);
+    if (first_index >= num_cmds) {
+        gcs().send_text(MAV_SEVERITY_WARNING, "Dynamic: no path uploaded");
+        return false;
+    }
+
+    // start from where we are, heading as set by WP_YAW_BEHAVIOR
+    sub.wp_nav.wp_and_spline_init_m();
+    bt_active = false;
+    path_running = true;
+    path_index = first_index;
+    path_reached_ms = 0;
+
+    switch (g.wp_yaw_behavior) {
+    case WP_YAW_BEHAVIOR_NONE:
+        break;
+    case WP_YAW_BEHAVIOR_LOOK_AHEAD:
+        sub.mode_guided.set_auto_yaw_mode(AUTO_YAW_LOOK_AHEAD);
+        break;
+    case WP_YAW_BEHAVIOR_CORRECT_XTRACK:
+        sub.mode_guided.set_auto_yaw_mode(AUTO_YAW_CORRECT_XTRACK);
+        break;
+    default:
+        sub.mode_guided.set_auto_yaw_mode(AUTO_YAW_LOOK_AT_NEXT_WP);
+        break;
+    }
+
+    if (!path_next_leg()) {
+        return false;
+    }
+    gcs().send_text(MAV_SEVERITY_INFO, "Dynamic: path started at #%u of %u", unsigned(path_index), unsigned(num_cmds - 1));
+    return true;
+}
+
+// stop following the path and hold where we are
+void ModeDynamic::stop_path(const char *reason)
+{
+    if (!path_running) {
+        return;
+    }
+    path_running = false;
+    gcs().send_text(MAV_SEVERITY_INFO, "Dynamic: path stopped (%s)", reason);
+    path_hold_here(false);
+}
+
+// hand over to the normal hold logic, at the final waypoint or where we stop
+void ModeDynamic::path_hold_here(bool at_destination)
+{
+    Vector2p hold_ne_m;
+    if (at_destination) {
+        hold_ne_m = sub.wp_nav.get_wp_destination_NED_m().xy();
+    } else {
+        position_control->get_stopping_point_NE_m(hold_ne_m);
+    }
+    set_horizontal_target(SubMode::POSITION, hold_ne_m, Vector2f());
+    set_vertical_target(SubMode::POSITION, -position_control->get_pos_desired_U_cm() * 0.01, 0.0f);
+
+    // keep the current heading unless it was set explicitly
+    if (sub.auto_yaw_mode != AUTO_YAW_LOOK_AT_HEADING && sub.auto_yaw_mode != AUTO_YAW_HOLD) {
+        sub.yaw_rate_only = false;
+        sub.yaw_look_at_heading = ahrs.yaw_sensor;
+        sub.yaw_look_at_heading_slew = AUTO_YAW_SLEW_RATE;
+        sub.mode_guided.set_auto_yaw_mode(AUTO_YAW_LOOK_AT_HEADING);
+    }
+}
+
+// process mission items from path_index until a waypoint leg is started.
+// Returns false (and stops) if the path is finished or a leg can't be started.
+bool ModeDynamic::path_next_leg()
+{
+    const uint16_t num_cmds = sub.mission.num_commands();
+    while (path_index < num_cmds) {
+        AP_Mission::Mission_Command cmd;
+        if (!sub.mission.read_cmd_from_storage(path_index, cmd)) {
+            stop_path("mission read failed");
+            return false;
+        }
+
+        switch (cmd.id) {
+        case MAV_CMD_NAV_WAYPOINT:
+        case MAV_CMD_NAV_SPLINE_WAYPOINT:
+        case MAV_CMD_NAV_LOITER_TIME:
+        case MAV_CMD_NAV_LOITER_UNLIM: {
+            Location loc(cmd.content.location);
+            if (loc.lat == 0 && loc.lng == 0) {
+                loc.lat = sub.current_loc.lat;
+                loc.lng = sub.current_loc.lng;
+            }
+            if (!sub.wp_nav.set_wp_destination_loc(loc)) {
+                stop_path("waypoint needs rangefinder/terrain data");
+                return false;
+            }
+            path_hold_s = (cmd.id == MAV_CMD_NAV_LOITER_UNLIM) ? 0 : cmd.p1;
+            path_reached_ms = 0;
+            return true;
+        }
+
+        case MAV_CMD_DO_CHANGE_SPEED:
+            if (cmd.content.speed.target_ms > 0) {
+                sub.wp_nav.set_speed_NE_ms(cmd.content.speed.target_ms);
+            }
+            break;
+
+        case MAV_CMD_CONDITION_YAW:
+            sub.mode_auto.set_auto_yaw_look_at_heading(cmd.content.yaw.angle_deg, cmd.content.yaw.turn_rate_dps,
+                                                       cmd.content.yaw.direction, cmd.content.yaw.relative_angle);
+            break;
+
+        default:
+            gcs().send_text(MAV_SEVERITY_WARNING, "Dynamic: path skips item #%u (cmd %u)", unsigned(path_index), unsigned(cmd.id));
+            break;
+        }
+        path_index++;
+    }
+
+    path_running = false;
+    gcs().send_text(MAV_SEVERITY_INFO, "Dynamic: path complete");
+    path_hold_here(true);
+    return false;
+}
+
+void ModeDynamic::run_path()
+{
+    // AC_WPNav runs the horizontal controller and sets the vertical targets
+    sub.failsafe_terrain_set_status(sub.wp_nav.update_wpnav());
+    position_control->D_update_controller();
+
+    if (!sub.wp_nav.reached_wp_destination()) {
+        return;
+    }
+    const uint32_t now_ms = AP_HAL::millis();
+    if (path_reached_ms == 0) {
+        path_reached_ms = now_ms;
+        gcs().send_text(MAV_SEVERITY_INFO, "Dynamic: reached #%u", unsigned(path_index));
+    }
+    AP_Mission::Mission_Command cmd;
+    if (sub.mission.read_cmd_from_storage(path_index, cmd) && cmd.id == MAV_CMD_NAV_LOITER_UNLIM) {
+        path_index = sub.mission.num_commands();
+        path_next_leg();
+        return;
+    }
+    if (now_ms - path_reached_ms >= path_hold_s * 1000U) {
+        path_index++;
+        path_next_leg();
+    }
 }
 
 /*

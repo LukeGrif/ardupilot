@@ -477,6 +477,12 @@ public:
     bool set_bottom_track_target_cm(float range_cm);
     bool dynamic_set_destination_NE_range(const Vector2f& destination_ne_cm, float range_cm);
 
+    // path following: fly the uploaded mission's waypoints with AC_WPNav, then hold
+    bool start_path(uint16_t first_index);
+    void stop_path(const char *reason);
+    bool path_active() const { return path_running; }
+    int16_t get_path_index() const { return path_running ? int16_t(path_index) : -1; }
+
 protected:
 
     const char *name() const override { return "Dynamic"; }
@@ -498,6 +504,9 @@ private:
     void update_horizontal(uint32_t now_ms, uint32_t timeout_ms);
     void update_vertical(uint32_t now_ms, uint32_t timeout_ms);
     void update_bottom_track();
+    void run_path();
+    bool path_next_leg();
+    void path_hold_here(bool at_destination);
     void update_yaw(float &target_yaw_rate_cds);
     void output_thrust();
     bool timed_out(uint32_t update_ms, uint32_t now_ms, uint32_t timeout_ms) const;
@@ -526,4 +535,10 @@ private:
     bool pilot_yawing = false;
 
     bool bt_active = false;
+
+    // path following state
+    bool path_running = false;
+    uint16_t path_index = 0;        // mission index of the current leg's waypoint
+    uint16_t path_hold_s = 0;       // seconds to wait at the current waypoint
+    uint32_t path_reached_ms = 0;   // when the current waypoint was reached, 0 if not yet
 };

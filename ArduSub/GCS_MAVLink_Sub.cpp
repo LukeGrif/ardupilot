@@ -166,6 +166,9 @@ bool GCS_MAVLINK_Sub::send_info()
     CHECK_PAYLOAD_SIZE(NAMED_VALUE_FLOAT);
     send_named_float("DynBTRange", sub.mode_dynamic.get_bottom_track_target_cm() * 0.01f);
 
+    CHECK_PAYLOAD_SIZE(NAMED_VALUE_FLOAT);
+    send_named_float("DynPathWP", sub.mode_dynamic.get_path_index());
+
     return true;
 }
 
@@ -435,7 +438,8 @@ MAV_RESULT GCS_MAVLINK_Sub::handle_command_int_packet(const mavlink_command_int_
         return handle_command_int_do_reposition(packet);
 
     case MAV_CMD_MISSION_START:
-        if (!is_zero(packet.param1) || !is_zero(packet.param2)) {
+        // Dynamic mode supports starting part way through (param1 = first item)
+        if (sub.control_mode != Mode::Number::DYNAMIC && (!is_zero(packet.param1) || !is_zero(packet.param2))) {
             // first-item/last item not supported
             return MAV_RESULT_DENIED;
         }
@@ -507,6 +511,10 @@ MAV_RESULT GCS_MAVLINK_Sub::handle_MAV_CMD_DO_CHANGE_SPEED(const mavlink_command
 
 MAV_RESULT GCS_MAVLINK_Sub::handle_MAV_CMD_MISSION_START(const mavlink_command_int_t &packet)
 {
+        // in Dynamic mode fly the mission's waypoints as a path, staying in Dynamic
+        if (sub.control_mode == Mode::Number::DYNAMIC) {
+            return sub.mode_dynamic.start_path(uint16_t(packet.param1)) ? MAV_RESULT_ACCEPTED : MAV_RESULT_FAILED;
+        }
         if (sub.motors.armed() && sub.set_mode(Mode::Number::AUTO, ModeReason::GCS_COMMAND)) {
             return MAV_RESULT_ACCEPTED;
         }
