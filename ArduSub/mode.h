@@ -50,7 +50,8 @@ public:
         POSHOLD =      16,  // automatic position hold with manual override, with automatic throttle
         MANUAL =       19,  // Pass-through input with no stabilization
         MOTOR_DETECT = 20,  // Automatically detect motors orientation
-        SURFTRAK =     21   // Track distance above seafloor (hold range)
+        SURFTRAK =     21,  // Track distance above seafloor (hold range)
+        DYNAMIC =      22,  // guided-style external control that holds position between commands, with commanded roll/pitch and optional bottom tracking
         // Mode number 30 reserved for "offboard" for external/lua control.
     };
 
@@ -434,4 +435,95 @@ protected:
     const char *name() const override { return "Motor Detection"; }
     const char *name4() const override { return "DETE"; }
     Mode::Number number() const override { return Mode::Number::MOTOR_DETECT; }
+};
+
+
+// DYNAMIC: accepts the same external commands as GUIDED, but always holds
+// position (and depth, or range to the bottom) when no command is active, and
+// holds a commanded roll/pitch attitude while doing so.
+class ModeDynamic : public Mode
+{
+
+public:
+    // inherit constructor
+    using Mode::Mode;
+
+    virtual void run() override;
+
+    bool init(bool ignore_checks) override;
+    bool requires_GPS() const override { return true; }
+    bool requires_altitude() const override { return true; }
+    bool allows_arming(bool from_gcs) const override { return true; }
+    bool is_autopilot() const override { return true; }
+    bool in_guided_mode() const override { return true; }
+
+    // same targets as ModeGuided (NEU frame, cm and cm/s, relative to the EKF origin)
+    bool dynamic_set_destination(const Vector3f& destination);
+    bool dynamic_set_destination(const Location& dest_loc);
+    bool dynamic_set_destination(const Vector3f& destination, bool use_yaw, float yaw_cd, bool use_yaw_rate, float yaw_rate_cds, bool relative_yaw);
+    void dynamic_set_velocity(const Vector3f& velocity);
+    void dynamic_set_velocity(const Vector3f& velocity, bool use_yaw, float yaw_cd, bool use_yaw_rate, float yaw_rate_cds, bool relative_yaw);
+    bool dynamic_set_destination_posvel(const Vector3f& destination, const Vector3f& velocity);
+    bool dynamic_set_destination_posvel(const Vector3f& destination, const Vector3f& velocity, bool use_yaw, float yaw_cd, bool use_yaw_rate, float yaw_rate_cds, bool relative_yaw);
+    void dynamic_set_yaw_state(bool use_yaw, float yaw_cd, bool use_yaw_rate, float yaw_rate_cds, bool relative_angle);
+
+    // set roll and pitch targets from an attitude quaternion (yaw is ignored),
+    // plus optional climb rate and yaw rate
+    void dynamic_set_angle(const Quaternion &q, bool use_attitude, bool use_climb_rate, float climb_rate_cms, bool use_yaw_rate, float yaw_rate_cds);
+
+    // bottom tracking: hold a range above the seafloor using the downward rangefinder
+    bool bottom_track_active() const { return bt_active; }
+    float get_bottom_track_target_cm() const;
+    bool set_bottom_track_target_cm(float range_cm);
+    bool dynamic_set_destination_NE_range(const Vector2f& destination_ne_cm, float range_cm);
+
+protected:
+
+    const char *name() const override { return "Dynamic"; }
+    const char *name4() const override { return "DYNM"; }
+    Mode::Number number() const override { return Mode::Number::DYNAMIC; }
+
+private:
+
+    enum class SubMode : uint8_t {
+        POSITION,   // move to and hold a position target
+        VELOCITY,   // follow a velocity target, holding position once it stops
+        POSVEL,     // follow a position target moving at a velocity
+    };
+
+    bool check_destination(const Vector3f& destination) const;
+    void set_horizontal_target(SubMode submode, const Vector2p& pos_ne_m, const Vector2f& vel_ne_ms);
+    void set_vertical_target(SubMode submode, float pos_d_m, float vel_d_ms);
+    void init_controllers();
+    void update_horizontal(uint32_t now_ms, uint32_t timeout_ms);
+    void update_vertical(uint32_t now_ms, uint32_t timeout_ms);
+    void update_bottom_track();
+    void update_yaw(float &target_yaw_rate_cds);
+    void output_thrust();
+    bool timed_out(uint32_t update_ms, uint32_t now_ms, uint32_t timeout_ms) const;
+
+    SubMode horiz_submode = SubMode::POSITION;
+    SubMode vert_submode = SubMode::POSITION;
+
+    // horizontal targets (NED frame, m and m/s)
+    Vector2p pos_target_ne_m;
+    Vector2f vel_target_ne_ms;
+    uint32_t horiz_update_ms = 0;
+
+    // vertical targets (NED frame, m and m/s). When bottom tracking is active,
+    // pos_target_d_m is relative to the tracked seafloor (i.e. minus the range).
+    float pos_target_d_m = 0.0f;
+    float vel_target_d_ms = 0.0f;
+    uint32_t vert_update_ms = 0;
+    bool climb_from_thrust = false;
+
+    // roll and pitch targets in centidegrees
+    float roll_target_cd = 0.0f;
+    float pitch_target_cd = 0.0f;
+    uint32_t att_update_ms = 0;
+
+    uint32_t yaw_rate_update_ms = 0;
+    bool pilot_yawing = false;
+
+    bool bt_active = false;
 };

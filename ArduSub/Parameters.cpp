@@ -772,6 +772,40 @@ const AP_Param::GroupInfo ParametersG2::var_info[] = {
     // This allows one time conversion while allowing user to flash between versions with and without converted params
     AP_GROUPINFO_FLAGS("PARM_FMT_VER", 24, ParametersG2, param_conversion_increment, 0, AP_PARAM_FLAG_HIDDEN),
 
+    // @Param: DYN_TIMEOUT
+    // @DisplayName: Dynamic mode command timeout
+    // @Description: In Dynamic mode, velocity, climb rate and yaw rate commands that have not been refreshed for this long are stopped and the vehicle holds its position, depth and heading.
+    // @Units: s
+    // @Range: 0.1 10
+    // @Increment: 0.1
+    // @User: Standard
+    AP_GROUPINFO("DYN_TIMEOUT", 25, ParametersG2, dyn_timeout, 1.0f),
+
+    // @Param: DYN_ANG_MAX
+    // @DisplayName: Dynamic mode maximum roll and pitch
+    // @Description: Maximum roll and pitch angle that can be commanded in Dynamic mode (via SET_ATTITUDE_TARGET plus pilot input). Each axis is limited separately.
+    // @Units: deg
+    // @Range: 0 85
+    // @Increment: 1
+    // @User: Standard
+    AP_GROUPINFO("DYN_ANG_MAX", 26, ParametersG2, dyn_angle_max, 60.0f),
+
+    // @Param: DYN_ATT_TIMEOUT
+    // @DisplayName: Dynamic mode attitude timeout
+    // @Description: In Dynamic mode, if no attitude command is received for this long the roll and pitch targets return to level. 0 holds the last commanded roll and pitch indefinitely.
+    // @Units: s
+    // @Range: 0 60
+    // @Increment: 0.5
+    // @User: Standard
+    AP_GROUPINFO("DYN_ATT_TIMEOUT", 27, ParametersG2, dyn_att_timeout, 0.0f),
+
+    // @Param: DYN_BT_ENABLE
+    // @DisplayName: Dynamic mode bottom tracking
+    // @Description: When enabled, Dynamic mode uses the downward-facing rangefinder (e.g. a DVL's distance output) to hold range above the seafloor instead of a fixed depth. Bottom tracking engages once the rangefinder is healthy and the vehicle is below SURFTRAK_DEPTH. Vertical commands move the vehicle relative to the seafloor, and the range is held wherever they stop.
+    // @Values: 0:Disabled,1:Enabled
+    // @User: Standard
+    AP_GROUPINFO("DYN_BT_ENABLE", 28, ParametersG2, dyn_bt_enable, 0),
+
     AP_GROUPEND
 };
 

@@ -590,8 +590,8 @@ bool Sub::verify_yaw()
 // do_guided - start guided mode
 bool Sub::do_guided(const AP_Mission::Mission_Command& cmd)
 {
-    // only process guided waypoint if we are in guided mode
-    if (control_mode != Mode::Number::GUIDED && !(control_mode == Mode::Number::AUTO && auto_mode == Auto_NavGuided)) {
+    // only process guided waypoint if we are in guided or dynamic mode
+    if (control_mode != Mode::Number::GUIDED && control_mode != Mode::Number::DYNAMIC && !(control_mode == Mode::Number::AUTO && auto_mode == Auto_NavGuided)) {
         return false;
     }
 
@@ -599,6 +599,9 @@ bool Sub::do_guided(const AP_Mission::Mission_Command& cmd)
     switch (cmd.id) {
 
     case MAV_CMD_NAV_WAYPOINT: {
+        if (control_mode == Mode::Number::DYNAMIC) {
+            return sub.mode_dynamic.dynamic_set_destination(cmd.content.location);
+        }
         // set wp_nav's destination
         return sub.mode_guided.guided_set_destination(cmd.content.location);
     }

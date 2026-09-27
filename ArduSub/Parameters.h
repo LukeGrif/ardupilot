@@ -410,6 +410,12 @@ public:
 
     // Used to track parameter conversions
     AP_Int8 param_conversion_increment;
+
+    // Dynamic mode
+    AP_Float dyn_timeout;
+    AP_Float dyn_angle_max;
+    AP_Float dyn_att_timeout;
+    AP_Int8 dyn_bt_enable;
 };
 
 extern const AP_Param::Info        var_info[];

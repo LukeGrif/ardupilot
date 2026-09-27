@@ -25,6 +25,7 @@ uint8_t GCS_MAVLINK_Sub::base_mode() const
     switch (sub.control_mode) {
     case Mode::Number::AUTO:
     case Mode::Number::GUIDED:
+    case Mode::Number::DYNAMIC:
     case Mode::Number::CIRCLE:
     case Mode::Number::POSHOLD:
         _base_mode |= MAV_MODE_FLAG_GUIDED_ENABLED;
@@ -161,6 +162,9 @@ bool GCS_MAVLINK_Sub::send_info()
 
     CHECK_PAYLOAD_SIZE(NAMED_VALUE_FLOAT);
     send_named_float("RFTarget", sub.mode_surftrak.get_rangefinder_target_cm() * 0.01f);
+
+    CHECK_PAYLOAD_SIZE(NAMED_VALUE_FLOAT);
+    send_named_float("DynBTRange", sub.mode_dynamic.get_bottom_track_target_cm() * 0.01f);
 
     return true;
 }
@@ -392,6 +396,10 @@ MAV_RESULT GCS_MAVLINK_Sub::handle_command_int_do_reposition(const mavlink_comma
         return MAV_RESULT_DENIED; // failed as the location is not valid
     }
 
+    if (sub.control_mode == Mode::Number::DYNAMIC) {
+        return sub.mode_dynamic.dynamic_set_destination(request_location) ? MAV_RESULT_ACCEPTED : MAV_RESULT_FAILED;
+    }
+
     // we need to do this first, as we don't want to change the flight mode unless we can also set the target
     if (!sub.mode_guided.guided_set_destination(request_location)) {
         return MAV_RESULT_FAILED;
@@ -572,6 +580,25 @@ void GCS_MAVLINK_Sub::handle_message(const mavlink_message_t &msg)
             sub.set_attitude_target_no_gps = {AP_HAL::millis(), packet};
         }
 
+        if (sub.control_mode == Mode::Number::DYNAMIC) {
+            // roll/pitch are held alongside position control; attitude or thrust may be masked out individually
+            const bool use_attitude = !(packet.type_mask & (1<<7));
+            const bool use_thrust = !(packet.type_mask & (1<<6));
+            const bool use_yaw_rate = !(packet.type_mask & (1<<2));
+            float climb_rate_cms = 0.0f;
+            if (use_thrust) {
+                const float thrust = constrain_float(packet.thrust, 0.0f, 1.0f);
+                if (thrust > 0.5f) {
+                    climb_rate_cms = (thrust - 0.5f) * 2.0f * sub.wp_nav.get_default_speed_up_cms();
+                } else {
+                    climb_rate_cms = (thrust - 0.5f) * 2.0f * sub.wp_nav.get_default_speed_down_cms();
+                }
+            }
+            sub.mode_dynamic.dynamic_set_angle(Quaternion(packet.q[0],packet.q[1],packet.q[2],packet.q[3]), use_attitude,
+                                               use_thrust, climb_rate_cms, use_yaw_rate, degrees(packet.body_yaw_rate) * 100.0f);
+            break;
+        }
+
         // ensure type_mask specifies to use attitude and thrust
         if ((packet.type_mask & ((1<<7)|(1<<6))) != 0) {
             break;
@@ -598,8 +625,8 @@ void GCS_MAVLINK_Sub::handle_message(const mavlink_message_t &msg)
         mavlink_set_position_target_local_ned_t packet;
         mavlink_msg_set_position_target_local_ned_decode(&msg, &packet);
 
-        // exit if vehicle is not in Guided mode or Auto-Guided mode
-        if ((sub.control_mode != Mode::Number::GUIDED) && !(sub.control_mode == Mode::Number::AUTO && sub.auto_mode == Auto_NavGuided)) {
+        // exit if vehicle is not in Guided, Dynamic or Auto-Guided mode
+        if ((sub.control_mode != Mode::Number::GUIDED) && (sub.control_mode != Mode::Number::DYNAMIC) && !(sub.control_mode == Mode::Number::AUTO && sub.auto_mode == Auto_NavGuided)) {
             break;
         }
 
@@ -662,7 +689,18 @@ void GCS_MAVLINK_Sub::handle_message(const mavlink_message_t &msg)
         }
 
         // send request
-        if (!pos_ignore && !vel_ignore && acc_ignore) {
+        if (sub.control_mode == Mode::Number::DYNAMIC) {
+            if (!pos_ignore && !vel_ignore && acc_ignore) {
+                sub.mode_dynamic.dynamic_set_destination_posvel(pos_vector, vel_vector, !yaw_ignore, yaw_cd, !yaw_rate_ignore, yaw_rate_cds, yaw_relative);
+            } else if (pos_ignore && !vel_ignore && acc_ignore) {
+                sub.mode_dynamic.dynamic_set_velocity(vel_vector, !yaw_ignore, yaw_cd, !yaw_rate_ignore, yaw_rate_cds, yaw_relative);
+            } else if (!pos_ignore && vel_ignore && acc_ignore) {
+                sub.mode_dynamic.dynamic_set_destination(pos_vector, !yaw_ignore, yaw_cd, !yaw_rate_ignore, yaw_rate_cds, yaw_relative);
+            } else if (pos_ignore && vel_ignore && acc_ignore) {
+                // yaw or yaw rate only, position is held
+                sub.mode_dynamic.dynamic_set_yaw_state(!yaw_ignore, yaw_cd, !yaw_rate_ignore, yaw_rate_cds, yaw_relative);
+            }
+        } else if (!pos_ignore && !vel_ignore && acc_ignore) {
             sub.mode_guided.guided_set_destination_posvel(pos_vector, vel_vector, !yaw_ignore, yaw_cd, !yaw_rate_ignore, yaw_rate_cds, yaw_relative);
         } else if (pos_ignore && !vel_ignore && acc_ignore) {
             sub.mode_guided.guided_set_velocity(vel_vector, !yaw_ignore, yaw_cd, !yaw_rate_ignore, yaw_rate_cds, yaw_relative);
@@ -678,8 +716,9 @@ void GCS_MAVLINK_Sub::handle_message(const mavlink_message_t &msg)
         mavlink_set_position_target_global_int_t packet;
         mavlink_msg_set_position_target_global_int_decode(&msg, &packet);
 
-        // exit if vehicle is not in Guided, Auto-Guided, or Depth Hold modes
+        // exit if vehicle is not in Guided, Dynamic, Auto-Guided, or Depth Hold modes
         if ((sub.control_mode != Mode::Number::GUIDED)
+            && (sub.control_mode != Mode::Number::DYNAMIC)
             && !(sub.control_mode == Mode::Number::AUTO && sub.auto_mode == Auto_NavGuided)
             && !(sub.control_mode == Mode::Number::ALT_HOLD)) {
             break;
@@ -699,6 +738,21 @@ void GCS_MAVLINK_Sub::handle_message(const mavlink_message_t &msg)
 
         if (!z_ignore && sub.control_mode == Mode::Number::ALT_HOLD) { // Control only target depth when in ALT_HOLD
             sub.pos_control.set_pos_desired_U_cm(packet.alt*100);
+            break;
+        }
+
+        // in Dynamic mode an altitude above terrain is the range to hold above the seafloor (bottom tracking)
+        if (sub.control_mode == Mode::Number::DYNAMIC && !pos_ignore && vel_ignore && acc_ignore &&
+            (packet.coordinate_frame == MAV_FRAME_GLOBAL_TERRAIN_ALT || packet.coordinate_frame == MAV_FRAME_GLOBAL_TERRAIN_ALT_INT)) {
+            if (!check_latlng(packet.lat_int, packet.lon_int)) {
+                break;
+            }
+            const Location loc{packet.lat_int, packet.lon_int, 0, Location::AltFrame::ABOVE_ORIGIN};
+            Vector2f pos_ne_cm;
+            if (!loc.get_vector_xy_from_origin_NE_cm(pos_ne_cm)) {
+                break;
+            }
+            sub.mode_dynamic.dynamic_set_destination_NE_range(pos_ne_cm, packet.alt * 100.0f);
             break;
         }
 
@@ -725,7 +779,15 @@ void GCS_MAVLINK_Sub::handle_message(const mavlink_message_t &msg)
             }
         }
 
-        if (!pos_ignore && !vel_ignore && acc_ignore) {
+        if (sub.control_mode == Mode::Number::DYNAMIC) {
+            if (!pos_ignore && !vel_ignore && acc_ignore) {
+                sub.mode_dynamic.dynamic_set_destination_posvel(pos_neu_cm, Vector3f(packet.vx * 100.0f, packet.vy * 100.0f, -packet.vz * 100.0f));
+            } else if (pos_ignore && !vel_ignore && acc_ignore) {
+                sub.mode_dynamic.dynamic_set_velocity(Vector3f(packet.vx * 100.0f, packet.vy * 100.0f, -packet.vz * 100.0f));
+            } else if (!pos_ignore && vel_ignore && acc_ignore) {
+                sub.mode_dynamic.dynamic_set_destination(pos_neu_cm);
+            }
+        } else if (!pos_ignore && !vel_ignore && acc_ignore) {
             sub.mode_guided.guided_set_destination_posvel(pos_neu_cm, Vector3f(packet.vx * 100.0f, packet.vy * 100.0f, -packet.vz * 100.0f));
         } else if (pos_ignore && !vel_ignore && acc_ignore) {
             sub.mode_guided.guided_set_velocity(Vector3f(packet.vx * 100.0f, packet.vy * 100.0f, -packet.vz * 100.0f));
@@ -848,6 +910,7 @@ uint8_t GCS_MAVLINK_Sub::send_available_mode(uint8_t index) const
         &sub.mode_circle,
         &sub.mode_surface,
         &sub.mode_motordetect,
+        &sub.mode_dynamic,
     };
 
     const uint8_t mode_count = ARRAY_SIZE(modes);
