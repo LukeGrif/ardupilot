@@ -19,6 +19,8 @@
  *   position control stays correct while the vehicle is rolled or pitched.
  * - With DYN_BT_ENABLE set, the downward rangefinder is used to hold range
  *   above the seafloor (bottom tracking) instead of a fixed depth.
+ * - Joystick forward/lateral/throttle/yaw sticks move the vehicle while held
+ *   and it holds position, depth and heading where they are released.
  * - MAV_CMD_MISSION_START flies the uploaded mission's waypoints (e.g. a
  *   lawnmower survey) with AC_WPNav, keeping the roll/pitch hold, then holds at
  *   the last waypoint. Any position/velocity command stops the path.
@@ -306,6 +308,9 @@ void ModeDynamic::run()
     const uint32_t now_ms = AP_HAL::millis();
     const uint32_t timeout_ms = MAX(g2.dyn_timeout.get(), 0.1f) * 1000;
 
+    // joystick forward/lateral/throttle (stops a running path when used)
+    update_pilot_translation();
+
     if (path_running) {
         run_path();
     } else {
@@ -351,6 +356,47 @@ void ModeDynamic::run()
     }
 
     output_thrust();
+}
+
+/*
+ * Joystick translation: forward/lateral sticks command a body-frame velocity
+ * (full stick = WP_SPD) and the throttle stick a climb rate (PILOT_SPEED_UP/DN).
+ * When a stick is released the target velocity goes to zero, so the vehicle
+ * stops and holds the position/depth it stopped at, like any other velocity
+ * command in this mode.
+ */
+void ModeDynamic::update_pilot_translation()
+{
+    if (sub.failsafe.pilot_input) {
+        pilot_horizontal = false;
+        pilot_vertical = false;
+        return;
+    }
+
+    const float forward = channel_forward->norm_input_dz();
+    const float lateral = channel_lateral->norm_input_dz();
+    if (fabsf(forward) > 0.02f || fabsf(lateral) > 0.02f) {
+        const float speed_ms = sub.wp_nav.get_default_speed_NE_ms();
+        const float cos_yaw = ahrs.cos_yaw();
+        const float sin_yaw = ahrs.sin_yaw();
+        const Vector2f vel_ne_ms{(forward * cos_yaw - lateral * sin_yaw) * speed_ms,
+                                 (forward * sin_yaw + lateral * cos_yaw) * speed_ms};
+        set_horizontal_target(SubMode::VELOCITY, pos_target_ne_m, vel_ne_ms);
+        pilot_horizontal = true;
+    } else if (pilot_horizontal) {
+        set_horizontal_target(SubMode::VELOCITY, pos_target_ne_m, Vector2f());
+        pilot_horizontal = false;
+    }
+
+    float climb_rate_cms = sub.get_pilot_desired_climb_rate(channel_throttle->get_control_in());
+    climb_rate_cms = constrain_float(climb_rate_cms, -sub.get_pilot_speed_dn(), g.pilot_speed_up);
+    if (fabsf(climb_rate_cms) > 1.0f) {
+        set_vertical_target(SubMode::VELOCITY, pos_target_d_m, -climb_rate_cms * 0.01f);
+        pilot_vertical = true;
+    } else if (pilot_vertical) {
+        set_vertical_target(SubMode::VELOCITY, pos_target_d_m, 0.0f);
+        pilot_vertical = false;
+    }
 }
 
 // pilot yaw input overrides the yaw target; the new heading is held when the pilot lets go

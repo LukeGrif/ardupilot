@@ -504,6 +504,7 @@ private:
     void update_horizontal(uint32_t now_ms, uint32_t timeout_ms);
     void update_vertical(uint32_t now_ms, uint32_t timeout_ms);
     void update_bottom_track();
+    void update_pilot_translation();
     void run_path();
     bool path_next_leg();
     void path_hold_here(bool at_destination);
@@ -533,6 +534,8 @@ private:
 
     uint32_t yaw_rate_update_ms = 0;
     bool pilot_yawing = false;
+    bool pilot_horizontal = false;  // forward/lateral stick deflected last loop
+    bool pilot_vertical = false;    // throttle stick deflected last loop
 
     bool bt_active = false;
 
