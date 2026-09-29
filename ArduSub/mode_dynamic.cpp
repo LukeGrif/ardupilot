@@ -42,6 +42,7 @@ bool ModeDynamic::init(bool ignore_checks)
 
     // hold the current heading
     pilot_yawing = false;
+    gcs_velocity_ms = 0;
     sub.yaw_rate_only = false;
     sub.yaw_look_at_heading = ahrs.yaw_sensor;
     sub.yaw_look_at_heading_slew = AUTO_YAW_SLEW_RATE;
@@ -81,6 +82,12 @@ void ModeDynamic::init_controllers()
 bool ModeDynamic::timed_out(uint32_t update_ms, uint32_t now_ms, uint32_t timeout_ms) const
 {
     return (now_ms - update_ms) > timeout_ms;
+}
+
+// true while velocity commands from a ground station keep arriving
+bool ModeDynamic::gcs_velocity_active() const
+{
+    return gcs_velocity_ms != 0 && (AP_HAL::millis() - gcs_velocity_ms) < GCS_VELOCITY_PRIORITY_MS;
 }
 
 void ModeDynamic::set_horizontal_target(SubMode submode, const Vector2p& pos_ne_m, const Vector2f& vel_ne_ms)
@@ -169,6 +176,7 @@ bool ModeDynamic::dynamic_set_destination(const Vector3f& destination, bool use_
 // set a velocity target (NEU, cm/s). The vehicle holds position when it times out.
 void ModeDynamic::dynamic_set_velocity(const Vector3f& velocity)
 {
+    gcs_velocity_ms = AP_HAL::millis();
     set_horizontal_target(SubMode::VELOCITY, pos_target_ne_m, Vector2f{velocity.x, velocity.y} * 0.01);
     set_vertical_target(SubMode::VELOCITY, pos_target_d_m, -velocity.z * 0.01);
 }
@@ -372,6 +380,13 @@ void ModeDynamic::update_pilot_translation()
         pilot_vertical = false;
         return;
     }
+    if (gcs_velocity_active()) {
+        // a ground station is streaming velocities (e.g. a gamepad in the
+        // control app): it has priority over the joystick sticks
+        pilot_horizontal = false;
+        pilot_vertical = false;
+        return;
+    }
 
     const float forward = channel_forward->norm_input_dz();
     const float lateral = channel_lateral->norm_input_dz();
@@ -403,6 +418,17 @@ void ModeDynamic::update_pilot_translation()
 void ModeDynamic::update_yaw(float &target_yaw_rate_cds)
 {
     if (sub.failsafe.pilot_input) {
+        return;
+    }
+    if (gcs_velocity_active()) {
+        if (pilot_yawing) {
+            // hand over from the stick: hold the heading reached
+            pilot_yawing = false;
+            sub.yaw_rate_only = false;
+            sub.yaw_look_at_heading = ahrs.yaw_sensor;
+            sub.yaw_look_at_heading_slew = AUTO_YAW_SLEW_RATE;
+            sub.mode_guided.set_auto_yaw_mode(AUTO_YAW_LOOK_AT_HEADING);
+        }
         return;
     }
     target_yaw_rate_cds = sub.get_pilot_desired_yaw_rate(channel_yaw->get_control_in());

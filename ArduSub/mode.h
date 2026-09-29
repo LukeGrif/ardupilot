@@ -511,6 +511,7 @@ private:
     void update_yaw(float &target_yaw_rate_cds);
     void output_thrust();
     bool timed_out(uint32_t update_ms, uint32_t now_ms, uint32_t timeout_ms) const;
+    bool gcs_velocity_active() const;
 
     SubMode horiz_submode = SubMode::POSITION;
     SubMode vert_submode = SubMode::POSITION;
@@ -536,6 +537,11 @@ private:
     bool pilot_yawing = false;
     bool pilot_horizontal = false;  // forward/lateral stick deflected last loop
     bool pilot_vertical = false;    // throttle stick deflected last loop
+
+    // GCS velocity commands take priority over the joystick sticks while
+    // they keep arriving (the control app's gamepad streams them)
+    static constexpr uint32_t GCS_VELOCITY_PRIORITY_MS = 500;
+    uint32_t gcs_velocity_ms = 0;
 
     bool bt_active = false;
 
