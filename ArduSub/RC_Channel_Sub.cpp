@@ -56,6 +56,15 @@ bool RC_Channels_Sub::has_valid_input() const
 // do_aux_function - implement the function invoked by auxiliary switches
 bool RC_Channel_Sub::do_aux_function(const AuxFuncTrigger &trigger)
 {
+    switch (trigger.func) {
+#if AUTOTUNE_ENABLED
+    case AUX_FUNC::AUTOTUNE_TEST_GAINS:
+        sub.mode_autotune.autotune.do_aux_function(trigger.pos);
+        return true;
+#endif
+    default:
+        break;
+    }
    return RC_Channel::do_aux_function(trigger);
 }
 #else

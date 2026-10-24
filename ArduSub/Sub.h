@@ -73,6 +73,9 @@
 #include "Parameters.h"
 #include "AP_Arming_Sub.h"
 #include "GCS_Sub.h"
+#if AUTOTUNE_ENABLED
+#include <AC_AutoTune/AC_AutoTune_Multi.h>
+#endif
 #include "mode.h"
 #include "script_button.h"
 
@@ -122,6 +125,8 @@ public:
     friend class ModeSurface;
     friend class ModeMotordetect;
     friend class ModeDynamic;
+    friend class AutoTune;
+    friend class ModeAutoTune;
 
     Sub(void);
 
@@ -632,6 +637,9 @@ private:
     ModeMotordetect mode_motordetect;
     ModeSurftrak mode_surftrak;
     ModeDynamic mode_dynamic;
+#if AUTOTUNE_ENABLED
+    ModeAutoTune mode_autotune;
+#endif
 
     // Auto
     AutoSubMode auto_mode;   // controls which auto controller is run

@@ -29,6 +29,7 @@ void GCS_Sub::update_vehicle_sensor_status_flags()
     case Mode::Number::AUTO:
     case Mode::Number::GUIDED:
     case Mode::Number::DYNAMIC:
+    case Mode::Number::AUTOTUNE:
     case Mode::Number::CIRCLE:
     case Mode::Number::SURFACE:
     case Mode::Number::POSHOLD:

@@ -47,6 +47,7 @@ public:
         GUIDED =        4,  // fully automatic fly to coordinate or fly at velocity/direction using GCS immediate commands
         CIRCLE =        7,  // automatic circular flight with automatic throttle
         SURFACE =       9,  // automatically return to surface, pilot maintains horizontal control
+        AUTOTUNE =     15,  // automatically tune the roll, pitch and yaw rate and angle gains
         POSHOLD =      16,  // automatic position hold with manual override, with automatic throttle
         MANUAL =       19,  // Pass-through input with no stabilization
         MOTOR_DETECT = 20,  // Automatically detect motors orientation
@@ -551,3 +552,57 @@ private:
     uint16_t path_hold_s = 0;       // seconds to wait at the current waypoint
     uint32_t path_reached_ms = 0;   // when the current waypoint was reached, 0 if not yet
 };
+
+#if AUTOTUNE_ENABLED
+/*
+  wrapper class for AC_AutoTune
+ */
+class AutoTune : public AC_AutoTune_Multi
+{
+public:
+    bool init() override;
+    void run() override;
+
+protected:
+    bool position_ok() override;
+    float get_desired_climb_rate_ms(void) const override;
+    void get_pilot_desired_rp_yrate_rad(float &des_roll_rad, float &des_pitch_rad, float &des_yaw_rate_rads) override;
+    void init_z_limits() override;
+#if HAL_LOGGING_ENABLED
+    void log_pids() override;
+#endif
+
+private:
+    void control_horizontal();
+};
+
+// AUTOTUNE: twitch-tunes the roll, pitch and yaw rate and angle gains while
+// holding depth and, when a position estimate is available, position
+class ModeAutoTune : public Mode
+{
+
+    // ParametersG2 sets a pointer within our autotune object:
+    friend class ParametersG2;
+
+public:
+    // inherit constructor
+    using Mode::Mode;
+
+    bool init(bool ignore_checks) override;
+    void run() override;
+    void exit();
+
+    bool requires_GPS() const override { return false; }
+    bool requires_altitude() const override { return true; }
+    bool allows_arming(bool from_gcs) const override { return false; }
+    bool is_autopilot() const override { return false; }
+
+    AutoTune autotune;
+
+protected:
+
+    const char *name() const override { return "AutoTune"; }
+    const char *name4() const override { return "ATUN"; }
+    Mode::Number number() const override { return Mode::Number::AUTOTUNE; }
+};
+#endif  // AUTOTUNE_ENABLED

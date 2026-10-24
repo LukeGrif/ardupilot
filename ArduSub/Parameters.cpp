@@ -806,6 +806,12 @@ const AP_Param::GroupInfo ParametersG2::var_info[] = {
     // @User: Standard
     AP_GROUPINFO("DYN_BT_ENABLE", 28, ParametersG2, dyn_bt_enable, 0),
 
+#if AUTOTUNE_ENABLED
+    // @Group: AUTOTUNE_
+    // @Path: ../libraries/AC_AutoTune/AC_AutoTune_Multi.cpp
+    AP_SUBGROUPPTR(autotune_ptr, "AUTOTUNE_", 29, ParametersG2, AutoTune),
+#endif
+
     AP_GROUPEND
 };
 
@@ -813,6 +819,9 @@ const AP_Param::GroupInfo ParametersG2::var_info[] = {
   constructor for g2 object
  */
 ParametersG2::ParametersG2()
+#if AUTOTUNE_ENABLED
+    : autotune_ptr(&sub.mode_autotune.autotune)
+#endif
 {
     AP_Param::setup_object_defaults(this, var_info);
 }
