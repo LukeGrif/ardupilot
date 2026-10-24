@@ -591,6 +591,56 @@ class AutoTestSub(vehicle_test_suite.TestSuite):
             raise NotAchievedException("Position Hold was unable to move north 2 meters, moved {} at {} degrees instead".format(distance_m, bearing))  # noqa
         self.disarm_vehicle()
 
+    def AutoTune(self):
+        """Test AUTOTUNE mode on the 8-thruster vectored_6dof frame"""
+        # autotune changes gains that are not in our context, so
+        # restart SITL with a fresh vehicle afterwards
+        self.customise_SITL_commandline(
+            [],
+            model="vectored_6dof",
+            defaults_filepath=self.model_defaults_filepath("vectored_6dof"),
+            wipe=True,
+        )
+
+        gain_names = [
+            "ATC_RAT_RLL_P",
+            "ATC_RAT_RLL_D",
+            "ATC_RAT_PIT_P",
+            "ATC_RAT_PIT_D",
+            "ATC_RAT_YAW_P",
+            "ATC_ANG_RLL_P",
+            "ATC_ANG_PIT_P",
+            "ATC_ANG_YAW_P",
+        ]
+        ogains = self.get_parameters(gain_names)
+
+        self.wait_ready_to_arm()
+        self.arm_vehicle()
+        self.change_mode('ALT_HOLD')
+        self.set_rc(Joystick.Throttle, 1300)
+        self.wait_altitude(altitude_min=-8, altitude_max=-6)
+        self.set_rc(Joystick.Throttle, 1500)
+        self.delay_sim_time(3)
+
+        start_pos = self.mav.location()
+        tstart = self.get_sim_time()
+        self.change_mode(15)  # AUTOTUNE
+        self.wait_statustext("AutoTune: Success", timeout=3600)
+        self.progress("AUTOTUNE OK (%u seconds)" % (self.get_sim_time() - tstart))
+
+        distance_m = self.get_distance(start_pos, self.mav.location())
+        self.progress("Drifted %.2fm during autotune" % distance_m)
+        if distance_m > 2:
+            raise NotAchievedException("Drifted %.2fm during autotune" % distance_m)
+
+        # disarming in AUTOTUNE saves the tuned gains
+        self.disarm_vehicle()
+        ngains = self.get_parameters(gain_names)
+        for name in gain_names:
+            self.progress("%s: %f -> %f" % (name, ogains[name], ngains[name]))
+        if all(ogains[name] == ngains[name] for name in gain_names):
+            raise NotAchievedException("AUTOTUNE gains not saved")
+
     def MotorThrustHoverParameterIgnore(self):
         """Test if we are ignoring MOT_THST_HOVER parameter"""
 
@@ -1328,6 +1378,7 @@ class AutoTestSub(vehicle_test_suite.TestSuite):
             self.SimTerrainMission,
             self.RngfndQuality,
             self.PositionHold,
+            self.AutoTune,
             self.ModeChanges,
             self.MAV_mgs,
             self.DiveMission,
