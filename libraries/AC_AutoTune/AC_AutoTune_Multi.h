@@ -85,6 +85,14 @@ protected:
     // (Unused) Placeholder for post-test announcements
     void do_post_test_gcs_announcements() override {};
 
+    // what the test that just finished measured, for vehicles that report
+    // each test (valid in do_post_test_gcs_announcements()): rate tests in
+    // centidegrees/s, angle tests in centidegrees
+    bool test_is_angle() const { return tune_type == TuneType::ANGLE_P_DOWN || tune_type == TuneType::ANGLE_P_UP; }
+    float test_target_cd() const { return test_is_angle() ? target_angle : target_rate; }
+    float test_max_cd() const { return test_is_angle() ? test_angle_max : test_rate_max; }
+    float test_min_cd() const { return test_is_angle() ? test_angle_min : test_rate_min; }
+
     // Reports final tuned gains to the ground station
     void report_final_gains(AxisType test_axis) const override;
 

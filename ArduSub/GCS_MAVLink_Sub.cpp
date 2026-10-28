@@ -237,6 +237,26 @@ void GCS_MAVLINK_Sub::send_water_depth()
 /*
   send PID tuning message
  */
+void GCS_MAVLINK_Sub::send_attitude_target()
+{
+    const Quaternion quat = sub.attitude_control.get_attitude_target_quat();
+    const Vector3f ang_vel = sub.attitude_control.get_attitude_target_ang_vel();
+    const float thrust = sub.attitude_control.get_throttle_in();
+
+    const float quat_out[4] {quat.q1, quat.q2, quat.q3, quat.q4};
+
+    mavlink_msg_attitude_target_send(
+        chan,
+        AP_HAL::millis(),       // time since boot (ms)
+        0,                      // typemask: everything is valid
+        quat_out,               // attitude target quaternion [w, x, y, z]
+        ang_vel.x,              // roll rate (rad/s)
+        ang_vel.y,              // pitch rate (rad/s)
+        ang_vel.z,              // yaw rate (rad/s)
+        thrust);                // throttle, 0 .. 1
+}
+
+// desired and achieved body rates in deg/s, PID terms as rate controller outputs
 void GCS_MAVLINK_Sub::send_pid_tuning()
 {
     const Parameters &g = sub.g;
@@ -247,12 +267,12 @@ void GCS_MAVLINK_Sub::send_pid_tuning()
     if (g.gcs_pid_mask & 1) {
         const AP_PIDInfo &pid_info = attitude_control.get_rate_roll_pid().get_pid_info();
         mavlink_msg_pid_tuning_send(chan, PID_TUNING_ROLL,
-                                    pid_info.target*0.01f,
+                                    degrees(pid_info.target),
                                     degrees(gyro.x),
-                                    pid_info.FF*0.01f,
-                                    pid_info.P*0.01f,
-                                    pid_info.I*0.01f,
-                                    pid_info.D*0.01f,
+                                    pid_info.FF,
+                                    pid_info.P,
+                                    pid_info.I,
+                                    pid_info.D,
                                     pid_info.slew_rate,
                                     pid_info.Dmod);
         if (!HAVE_PAYLOAD_SPACE(chan, PID_TUNING)) {
@@ -262,12 +282,12 @@ void GCS_MAVLINK_Sub::send_pid_tuning()
     if (g.gcs_pid_mask & 2) {
         const AP_PIDInfo &pid_info = attitude_control.get_rate_pitch_pid().get_pid_info();
         mavlink_msg_pid_tuning_send(chan, PID_TUNING_PITCH,
-                                    pid_info.target*0.01f,
+                                    degrees(pid_info.target),
                                     degrees(gyro.y),
-                                    pid_info.FF*0.01f,
-                                    pid_info.P*0.01f,
-                                    pid_info.I*0.01f,
-                                    pid_info.D*0.01f,
+                                    pid_info.FF,
+                                    pid_info.P,
+                                    pid_info.I,
+                                    pid_info.D,
                                     pid_info.slew_rate,
                                     pid_info.Dmod);
         if (!HAVE_PAYLOAD_SPACE(chan, PID_TUNING)) {
@@ -277,12 +297,12 @@ void GCS_MAVLINK_Sub::send_pid_tuning()
     if (g.gcs_pid_mask & 4) {
         const AP_PIDInfo &pid_info = attitude_control.get_rate_yaw_pid().get_pid_info();
         mavlink_msg_pid_tuning_send(chan, PID_TUNING_YAW,
-                                    pid_info.target*0.01f,
+                                    degrees(pid_info.target),
                                     degrees(gyro.z),
-                                    pid_info.FF*0.01f,
-                                    pid_info.P*0.01f,
-                                    pid_info.I*0.01f,
-                                    pid_info.D*0.01f,
+                                    pid_info.FF,
+                                    pid_info.P,
+                                    pid_info.I,
+                                    pid_info.D,
                                     pid_info.slew_rate,
                                     pid_info.Dmod);
         if (!HAVE_PAYLOAD_SPACE(chan, PID_TUNING)) {
@@ -292,12 +312,12 @@ void GCS_MAVLINK_Sub::send_pid_tuning()
     if (g.gcs_pid_mask & 8) {
         const AP_PIDInfo &pid_info = sub.pos_control.D_get_accel_pid().get_pid_info();
         mavlink_msg_pid_tuning_send(chan, PID_TUNING_ACCZ,
-                                    pid_info.target*0.01f,
+                                    pid_info.target,
                                     -(ahrs.get_accel_ef().z + GRAVITY_MSS),
-                                    pid_info.FF*0.01f,
-                                    pid_info.P*0.01f,
-                                    pid_info.I*0.01f,
-                                    pid_info.D*0.01f,
+                                    pid_info.FF,
+                                    pid_info.P,
+                                    pid_info.I,
+                                    pid_info.D,
                                     pid_info.slew_rate,
                                     pid_info.Dmod);
         if (!HAVE_PAYLOAD_SPACE(chan, PID_TUNING)) {

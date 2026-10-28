@@ -157,6 +157,46 @@ void AutoTune::log_pids()
 #endif
 
 /*
+  after each twitch, before the gains change, send what it measured and the
+  gains it was testing as NAMED_VALUE_FLOATs, ATN last so a GCS knows the
+  set is complete:
+    ATAxis  0 roll, 1 pitch, 2 yaw
+    ATType  tune step (AC_AutoTune::TuneType: 0 rate D up, 1 rate D down,
+            2 rate P up, 4 angle P down, 5 angle P up)
+    ATTgt   target: rate in deg/s, or angle in deg for angle P steps
+    ATMax   peak measured
+    ATMin   lowest measured after the peak (the bounce-back)
+    ATRP, ATRD, ATSP  rate P, rate D and angle P under test on this axis
+ */
+void AutoTune::do_post_test_gcs_announcements()
+{
+    const uint8_t ax = uint8_t(axis);
+    float rp = 0, rd = 0, sp = 0;
+    switch (axis) {
+    case AxisType::ROLL:
+        rp = tune_roll_rp; rd = tune_roll_rd; sp = tune_roll_sp;
+        break;
+    case AxisType::PITCH:
+        rp = tune_pitch_rp; rd = tune_pitch_rd; sp = tune_pitch_sp;
+        break;
+    case AxisType::YAW:
+    case AxisType::YAW_D:
+        rp = tune_yaw_rp; rd = tune_yaw_rd; sp = tune_yaw_sp;
+        break;
+    }
+    test_count++;
+    gcs().send_named_float("ATAxis", ax > 2 ? 2 : ax);
+    gcs().send_named_float("ATType", float(uint8_t(tune_type)));
+    gcs().send_named_float("ATTgt", test_target_cd() * 0.01f);
+    gcs().send_named_float("ATMax", test_max_cd() * 0.01f);
+    gcs().send_named_float("ATMin", test_min_cd() * 0.01f);
+    gcs().send_named_float("ATRP", rp);
+    gcs().send_named_float("ATRD", rd);
+    gcs().send_named_float("ATSP", sp);
+    gcs().send_named_float("ATN", test_count);
+}
+
+/*
   check if we have a good position estimate
  */
 bool AutoTune::position_ok()

@@ -571,6 +571,11 @@ protected:
 #if HAL_LOGGING_ENABLED
     void log_pids() override;
 #endif
+    // report each test's measurement so a GCS can graph the tune
+    void do_post_test_gcs_announcements() override;
+
+private:
+    uint16_t test_count;
 };
 
 /*
