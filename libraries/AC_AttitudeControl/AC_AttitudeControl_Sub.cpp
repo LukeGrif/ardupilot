@@ -426,9 +426,11 @@ void AC_AttitudeControl_Sub::rate_controller_run()
     _rate_gyro_rads = _ahrs.get_gyro_latest();
     _rate_gyro_time_us = AP_HAL::micros64();
 
-    _motors.set_roll(get_rate_roll_pid().update_all(_ang_vel_body_rads.x, _rate_gyro_rads.x, _dt_s, _motors.limit.roll));
-    _motors.set_pitch(get_rate_pitch_pid().update_all(_ang_vel_body_rads.y, _rate_gyro_rads.y, _dt_s, _motors.limit.pitch));
-    _motors.set_yaw(get_rate_yaw_pid().update_all(_ang_vel_body_rads.z, _rate_gyro_rads.z, _dt_s, _motors.limit.yaw));
+    // _actuator_sysid: a test signal added straight to the outputs (system
+    // identification, AutoTune); zeroed by rate_controller_target_reset()
+    _motors.set_roll(get_rate_roll_pid().update_all(_ang_vel_body_rads.x, _rate_gyro_rads.x, _dt_s, _motors.limit.roll) + _actuator_sysid.x);
+    _motors.set_pitch(get_rate_pitch_pid().update_all(_ang_vel_body_rads.y, _rate_gyro_rads.y, _dt_s, _motors.limit.pitch) + _actuator_sysid.y);
+    _motors.set_yaw(get_rate_yaw_pid().update_all(_ang_vel_body_rads.z, _rate_gyro_rads.z, _dt_s, _motors.limit.yaw) + _actuator_sysid.z);
 }
 
 // sanity check parameters.  should be called once before takeoff

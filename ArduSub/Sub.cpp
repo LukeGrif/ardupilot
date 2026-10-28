@@ -184,6 +184,8 @@ void Sub::run_rate_controller()
     if (control_mode != Mode::Number::MANUAL && control_mode != Mode::Number::MOTOR_DETECT) {
         // run low level rate controllers that only require IMU data and set loop time
         attitude_control.rate_controller_run();
+        // clear one-shot inputs such as the AutoTune test signal
+        attitude_control.rate_controller_target_reset();
     }
 }
 
