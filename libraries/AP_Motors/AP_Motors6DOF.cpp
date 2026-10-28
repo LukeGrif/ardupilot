@@ -118,6 +118,13 @@ const AP_Param::GroupInfo AP_Motors6DOF::var_info[] = {
     // @User: Standard
     AP_GROUPINFO("12_DIRECTION", 13, AP_Motors6DOF, _motor_reverse[11], 1),
 
+    // @Param: THST_LIN
+    // @DisplayName: Thruster linearisation
+    // @Description: Correct each thruster's output for the ESC dead band and the thruster's thrust curve, so thrust is proportional to the controller's demand: MOT_SPIN_MIN is the output (fraction of the PWM range either side of neutral) where thrust starts, MOT_SPIN_MAX the output for full thrust, MOT_THST_EXPO the curve (0 linear, 1 quadratic), and MOT_BAT_VOLT_MAX/MIN compensate for battery voltage. For Blue Robotics T200 thrusters (manufacturer data, 16 V): MOT_SPIN_MIN 0.07, MOT_SPIN_MAX 1.0, MOT_THST_EXPO 0.6. When disabled the output is linear in PWM, as before.
+    // @Values: 0:Disabled,1:Enabled
+    // @User: Advanced
+    AP_GROUPINFO("THST_LIN", 14, AP_Motors6DOF, _thrust_linearise, 0),
+
     AP_GROUPEND
 };
 
@@ -229,6 +236,12 @@ void AP_Motors6DOF::output_min()
 
 int16_t AP_Motors6DOF::calc_thrust_to_pwm(float thrust_in) const
 {
+    if (_thrust_linearise > 0 && !is_zero(thrust_in)) {
+        // skip the ESC dead band and undo the thrust curve (and battery
+        // voltage) so thrust follows the demand
+        const float out = thr_lin.thrust_to_actuator(fabsf(thrust_in));
+        thrust_in = thrust_in > 0 ? out : -out;
+    }
     int16_t range_up = get_pwm_output_max() - 1500;
     int16_t range_down = 1500 - get_pwm_output_min();
     return 1500 + thrust_in * (thrust_in > 0 ? range_up : range_down);
