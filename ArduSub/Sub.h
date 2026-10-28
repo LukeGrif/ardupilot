@@ -126,6 +126,7 @@ public:
     friend class ModeMotordetect;
     friend class ModeDynamic;
     friend class AutoTune;
+    friend class SubTune;
     friend class ModeAutoTune;
 
     Sub(void);

@@ -571,17 +571,95 @@ protected:
 #if HAL_LOGGING_ENABLED
     void log_pids() override;
 #endif
-
-private:
-    void control_horizontal();
 };
 
-// AUTOTUNE: twitch-tunes the roll, pitch and yaw rate and angle gains while
+/*
+  gentle tune for ROVs: each axis is moved through slow, small sine
+  waves, a damping/restoring model is fitted to the response and the
+  gains are calculated from the model
+ */
+class SubTune
+{
+public:
+    SubTune();
+
+    // do not allow copying
+    CLASS_NO_COPY(SubTune);
+
+    static const struct AP_Param::GroupInfo var_info[];
+
+    bool use_sine_style() const { return style == 1; }
+
+    bool init();
+    void run();
+    void stop();
+    void disarmed(bool in_autotune_mode);
+    void do_aux_function(RC_Channel::AuxSwitchPos ch_flag);
+
+private:
+    enum class Axis : uint8_t { ROLL = 0, PITCH = 1, YAW = 2 };
+    enum class Step : uint8_t { SETTLE, EXCITE, DONE };
+
+    struct Gains {
+        float rate_p, rate_i, rate_d, rate_ff;
+        float angle_p;
+        float accel_radss;
+    };
+
+    AP_Int8 style;
+    AP_Int8 axes;
+    AP_Float amplitude_deg;
+    AP_Float period_s;
+    AP_Int8 cycles;
+    AP_Float bandwidth;
+
+    Step step;
+    Axis axis;
+    bool axis_done[3];
+    bool have_tuned[3];
+    Gains orig[3];
+    Gains tuned[3];
+    bool tuned_loaded;
+    bool aux_used;
+
+    uint32_t step_start_ms;
+    uint32_t still_start_ms;
+    uint32_t override_ms;
+    uint32_t last_msg_ms;
+    bool pilot_override;
+    float hold_yaw_rad;
+
+    // Fourier coefficients of the rate controller output and the body
+    // rate at the two test frequencies, accumulated over whole periods
+    float u_cos[2], u_sin[2];
+    float rate_cos[2], rate_sin[2];
+    float record_s;
+
+    AC_PID &rate_pid(Axis ax);
+    AC_P &angle_p(Axis ax);
+    const char *axis_name(Axis ax) const;
+    Gains get_gains(Axis ax);
+    void set_gains(Axis ax, const Gains &g);
+    void load_gains(bool use_tuned);
+    void save_gains();
+
+    bool next_axis();
+    void start_settle(uint32_t now_ms);
+    void start_excite(uint32_t now_ms);
+    void update_settle(uint32_t now_ms);
+    void update_excite(uint32_t now_ms);
+    void finish_axis();
+    float excitation_rad(float t_s) const;
+    void reset_sums();
+    bool fit_model(float &a, float &b, float &c, float &fit) const;
+};
+
+// AUTOTUNE: tunes the roll, pitch and yaw rate and angle gains while
 // holding depth and, when a position estimate is available, position
 class ModeAutoTune : public Mode
 {
 
-    // ParametersG2 sets a pointer within our autotune object:
+    // ParametersG2 sets a pointer within our autotune objects:
     friend class ParametersG2;
 
 public:
@@ -597,12 +675,23 @@ public:
     bool allows_arming(bool from_gcs) const override { return false; }
     bool is_autopilot() const override { return false; }
 
+    void disarmed(bool in_autotune_mode);
+    void do_aux_function(RC_Channel::AuxSwitchPos ch_flag);
+
+    // shared by both tune styles
+    void init_position_hold();
+    void control_horizontal();
+
     AutoTune autotune;
+    SubTune subtune;
 
 protected:
 
     const char *name() const override { return "AutoTune"; }
     const char *name4() const override { return "ATUN"; }
     Mode::Number number() const override { return Mode::Number::AUTOTUNE; }
+
+private:
+    bool using_sine = false;
 };
 #endif  // AUTOTUNE_ENABLED

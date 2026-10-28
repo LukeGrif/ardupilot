@@ -205,7 +205,7 @@ bool AP_Arming_Sub::disarm(const AP_Arming::Method method, bool do_disarm_checks
 
 #if AUTOTUNE_ENABLED
     // Possibly save auto tuned parameters
-    sub.mode_autotune.autotune.disarmed(sub.control_mode == Mode::Number::AUTOTUNE);
+    sub.mode_autotune.disarmed(sub.control_mode == Mode::Number::AUTOTUNE);
 #endif
 
     // clear input holds

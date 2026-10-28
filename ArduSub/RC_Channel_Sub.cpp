@@ -59,7 +59,7 @@ bool RC_Channel_Sub::do_aux_function(const AuxFuncTrigger &trigger)
     switch (trigger.func) {
 #if AUTOTUNE_ENABLED
     case AUX_FUNC::AUTOTUNE_TEST_GAINS:
-        sub.mode_autotune.autotune.do_aux_function(trigger.pos);
+        sub.mode_autotune.do_aux_function(trigger.pos);
         return true;
 #endif
     default:

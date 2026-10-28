@@ -810,6 +810,10 @@ const AP_Param::GroupInfo ParametersG2::var_info[] = {
     // @Group: AUTOTUNE_
     // @Path: ../libraries/AC_AutoTune/AC_AutoTune_Multi.cpp
     AP_SUBGROUPPTR(autotune_ptr, "AUTOTUNE_", 29, ParametersG2, AutoTune),
+
+    // @Group: ATUN_
+    // @Path: mode_autotune.cpp
+    AP_SUBGROUPPTR(subtune_ptr, "ATUN_", 30, ParametersG2, SubTune),
 #endif
 
     AP_GROUPEND
@@ -820,7 +824,8 @@ const AP_Param::GroupInfo ParametersG2::var_info[] = {
  */
 ParametersG2::ParametersG2()
 #if AUTOTUNE_ENABLED
-    : autotune_ptr(&sub.mode_autotune.autotune)
+    : autotune_ptr(&sub.mode_autotune.autotune),
+      subtune_ptr(&sub.mode_autotune.subtune)
 #endif
 {
     AP_Param::setup_object_defaults(this, var_info);

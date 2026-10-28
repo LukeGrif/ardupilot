@@ -420,6 +420,7 @@ public:
 #if AUTOTUNE_ENABLED
     // we need a pointer to autotune for the G2 table
     void *autotune_ptr;
+    void *subtune_ptr;
 #endif
 };
 
