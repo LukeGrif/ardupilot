@@ -62,7 +62,51 @@ Submarine::Submarine(const char *frame_str) :
         thrusters = vectored_6dof_thrusters;
         n_thrusters = 8;
     }
+
+    // "_t200": measured Blue Robotics T200 thrust instead of the quadratic
+    // approximation, e.g. --model vectored_6dof_t200
+    t200_thrust = strstr(frame_str, "_t200") != nullptr;
+
     lock_step_scheduled = true;
+}
+
+/*
+  Blue Robotics T200 thrust (kgf) at 16 V for ESC pulses 1100..1900 us in
+  4 us steps, from the manufacturer's public performance data (September
+  2019). Dead band about 1472-1528 us; thrust grows roughly with pulse^1.7;
+  reverse is weaker than forward.
+ */
+static const float t200_16v_kgf[] = {
+    -4.069f, -4.051f, -4.023f, -3.964f, -3.901f, -3.869f, -3.824f, -3.801f, -3.751f, -3.715f,
+    -3.656f, -3.588f, -3.520f, -3.452f, -3.397f, -3.311f, -3.252f, -3.202f, -3.107f, -3.039f,
+    -2.994f, -2.939f, -2.862f, -2.821f, -2.771f, -2.708f, -2.658f, -2.581f, -2.549f, -2.508f,
+    -2.454f, -2.381f, -2.354f, -2.277f, -2.236f, -2.195f, -2.118f, -2.082f, -2.023f, -1.978f,
+    -1.941f, -1.860f, -1.814f, -1.764f, -1.701f, -1.669f, -1.610f, -1.556f, -1.515f, -1.488f,
+    -1.438f, -1.397f, -1.347f, -1.302f, -1.256f, -1.202f, -1.161f, -1.120f, -1.102f, -1.052f,
+    -1.021f, -0.980f, -0.943f, -0.903f, -0.871f, -0.821f, -0.785f, -0.744f, -0.717f, -0.680f,
+    -0.649f, -0.617f, -0.581f, -0.540f, -0.513f, -0.481f, -0.445f, -0.417f, -0.386f, -0.354f,
+    -0.322f, -0.295f, -0.259f, -0.236f, -0.209f, -0.181f, -0.150f, -0.127f, -0.104f, -0.086f,
+    -0.068f, -0.050f, -0.036f, 0.000f, 0.000f, 0.000f, 0.000f, 0.000f, 0.000f, 0.000f,
+    0.000f, 0.000f, 0.000f, 0.000f, 0.000f, 0.000f, 0.000f, 0.000f, 0.041f, 0.054f,
+    0.077f, 0.100f, 0.127f, 0.154f, 0.181f, 0.218f, 0.249f, 0.290f, 0.322f, 0.358f,
+    0.399f, 0.435f, 0.472f, 0.513f, 0.558f, 0.603f, 0.640f, 0.680f, 0.721f, 0.776f,
+    0.816f, 0.871f, 0.907f, 0.948f, 0.993f, 1.034f, 1.098f, 1.143f, 1.184f, 1.238f,
+    1.279f, 1.329f, 1.388f, 1.438f, 1.483f, 1.538f, 1.588f, 1.651f, 1.692f, 1.760f,
+    1.823f, 1.878f, 1.932f, 1.991f, 2.046f, 2.123f, 2.177f, 2.218f, 2.277f, 2.381f,
+    2.431f, 2.517f, 2.576f, 2.654f, 2.731f, 2.758f, 2.839f, 2.889f, 2.976f, 3.053f,
+    3.107f, 3.171f, 3.216f, 3.302f, 3.375f, 3.420f, 3.511f, 3.606f, 3.683f, 3.738f,
+    3.819f, 3.887f, 3.955f, 4.060f, 4.146f, 4.255f, 4.305f, 4.382f, 4.509f, 4.527f,
+    4.649f, 4.708f, 4.785f, 4.835f, 4.931f, 5.012f, 5.076f, 5.144f, 5.175f, 5.221f,
+    5.245f,
+};
+
+float Submarine::t200_thrust_N(int16_t pwm)
+{
+    const uint8_t n = ARRAY_SIZE(t200_16v_kgf);
+    const float x = (constrain_int16(pwm, 1100, 1900) - 1100) / 4.0f;
+    const uint8_t i = MIN(uint8_t(x), uint8_t(n - 2));
+    const float frac = x - i;
+    return (t200_16v_kgf[i] + frac * (t200_16v_kgf[i+1] - t200_16v_kgf[i])) * GRAVITY_MSS;
 }
 
 float Submarine::perpendicular_distance_to_rangefinder_surface() const
@@ -82,14 +126,20 @@ void Submarine::calculate_forces(const struct sitl_input &input, Vector3f &rot_a
     for (int i = 0; i < n_thrusters; i++) {
         Thruster t = thrusters[i];
         int16_t pwm = input.servos[t.servo];
-        float output = 0;
-        // if valid pwm and not in the esc deadzone
-        // TODO: extract deadzone from parameters/vehicle code
-        if (pwm < 2000 && pwm > 1000 && (pwm < 1475 || pwm > 1525)) {
-            output = (pwm - 1500) / 400.0; // range -1~1
+        float thrust = 0;
+        if (t200_thrust) {
+            if (pwm > 1000 && pwm < 2000) {
+                thrust = t200_thrust_N(pwm);
+            }
+        } else {
+            float output = 0;
+            // if valid pwm and not in the esc deadzone
+            // TODO: extract deadzone from parameters/vehicle code
+            if (pwm < 2000 && pwm > 1000 && (pwm < 1475 || pwm > 1525)) {
+                output = (pwm - 1500) / 400.0; // range -1~1
+            }
+            thrust = output * fabs(output) * frame_property.thrust; // approximate pwm to thrust function using a quadratic curve
         }
-
-        float thrust = output * fabs(output) * frame_property.thrust; // approximate pwm to thrust function using a quadratic curve
         body_accel += t.linear * thrust / frame_property.weight;
         rot_accel += t.rotational * thrust * frame_property.thruster_mount_radius / frame_property.moment_of_inertia;
     }
