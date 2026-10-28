@@ -613,6 +613,7 @@ class AutoTestSub(vehicle_test_suite.TestSuite):
             "ATC_ANG_YAW_P",
         ]
         ogains = self.get_parameters(gain_names)
+        self.set_parameter("ATUN_STYLE", 0)  # twitch
 
         self.wait_ready_to_arm()
         self.arm_vehicle()
@@ -640,6 +641,72 @@ class AutoTestSub(vehicle_test_suite.TestSuite):
             self.progress("%s: %f -> %f" % (name, ogains[name], ngains[name]))
         if all(ogains[name] == ngains[name] for name in gain_names):
             raise NotAchievedException("AUTOTUNE gains not saved")
+
+    def AutoTuneGentle(self):
+        """Test the gentle sine-wave AUTOTUNE style on the vectored_6dof frame"""
+        self.customise_SITL_commandline(
+            [],
+            model="vectored_6dof",
+            defaults_filepath=self.model_defaults_filepath("vectored_6dof"),
+            wipe=True,
+        )
+
+        gain_names = [
+            "ATC_RAT_RLL_P",
+            "ATC_RAT_RLL_FF",
+            "ATC_RAT_PIT_P",
+            "ATC_RAT_PIT_FF",
+            "ATC_RAT_YAW_P",
+            "ATC_RAT_YAW_FF",
+            "ATC_ANG_RLL_P",
+            "ATC_ANG_YAW_P",
+        ]
+        ogains = self.get_parameters(gain_names)
+        self.set_parameter("ATUN_STYLE", 1)  # gentle
+        self.context_collect('STATUSTEXT')
+
+        self.wait_ready_to_arm()
+        self.arm_vehicle()
+        self.change_mode('ALT_HOLD')
+        self.set_rc(Joystick.Throttle, 1300)
+        self.wait_altitude(altitude_min=-8, altitude_max=-6)
+        self.set_rc(Joystick.Throttle, 1500)
+        self.delay_sim_time(3)
+
+        start_pos = self.mav.location()
+        tstart = self.get_sim_time()
+
+        def check_fit(mav, m):
+            if m.get_type() == 'STATUSTEXT' and "fit poor" in m.text:
+                raise NotAchievedException("Model fit failed: %s" % m.text)
+        self.install_message_hook_context(check_fit)
+
+        self.change_mode(15)  # AUTOTUNE
+        self.wait_statustext("AutoTune: Success", timeout=600)
+        self.progress("AUTOTUNE OK (%u seconds)" % (self.get_sim_time() - tstart))
+
+        # the vehicle now flies on the tuned gains; check it holds level
+        tstart = self.get_sim_time()
+        while self.get_sim_time_cached() - tstart < 10:
+            m = self.assert_receive_message('ATTITUDE')
+            if abs(degrees(m.roll)) > 5 or abs(degrees(m.pitch)) > 5:
+                raise NotAchievedException("Not level on tuned gains: roll=%.1f pitch=%.1f" %
+                                           (degrees(m.roll), degrees(m.pitch)))
+
+        distance_m = self.get_distance(start_pos, self.mav.location())
+        self.progress("Drifted %.2fm during autotune" % distance_m)
+        if distance_m > 2:
+            raise NotAchievedException("Drifted %.2fm during autotune" % distance_m)
+
+        # disarming in AUTOTUNE saves the tuned gains
+        self.disarm_vehicle()
+        self.wait_statustext("AutoTune: Saved gains", check_context=True)
+        ngains = self.get_parameters(gain_names)
+        for name in gain_names:
+            self.progress("%s: %f -> %f" % (name, ogains[name], ngains[name]))
+        for name in "ATC_RAT_RLL_FF", "ATC_RAT_PIT_FF", "ATC_RAT_YAW_FF":
+            if ngains[name] <= 0:
+                raise NotAchievedException("%s not tuned" % name)
 
     def MotorThrustHoverParameterIgnore(self):
         """Test if we are ignoring MOT_THST_HOVER parameter"""
@@ -1379,6 +1446,7 @@ class AutoTestSub(vehicle_test_suite.TestSuite):
             self.RngfndQuality,
             self.PositionHold,
             self.AutoTune,
+            self.AutoTuneGentle,
             self.ModeChanges,
             self.MAV_mgs,
             self.DiveMission,
