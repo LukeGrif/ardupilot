@@ -593,7 +593,8 @@ public:
 
     static const struct AP_Param::GroupInfo var_info[];
 
-    bool use_sine_style() const { return style == 1; }
+    // the gentle styles (1 and 2) run here; twitch (0) in AutoTune
+    bool use_sine_style() const { return style >= 1; }
 
     bool init();
     void run();
@@ -621,6 +622,8 @@ private:
     AP_Int8 cycles;
     AP_Float bandwidth;
     AP_Int8 diag;
+    AP_Float rate_dps;
+    AP_Float inj_max;
 
     Step step;
     Axis axis;
@@ -643,6 +646,51 @@ private:
     float u_cos[2], u_sin[2];
     float rate_cos[2], rate_sin[2];
     float record_s;
+
+    // model style (ATUN_STYLE 2): the test signal is added to the tested
+    // axis's thruster output while the vehicle holds level, and
+    //   acc = a*u + e*sign(u) - b*w - b2*|w|*w - c*sin(angle) + d
+    // is fitted by least squares at the loop rate, for several thruster lags.
+    // e is the thrust step left at zero output by an imperfect dead band
+    // compensation (MOT_SPIN_MIN)
+    static constexpr uint8_t MODEL_N = 6;       // a, e, b, b2, c, d
+    static constexpr uint8_t MODEL_LAGS = 13;   // 0, 5, ... 60 ms
+    static constexpr uint8_t MODEL_PACK = MODEL_N * (MODEL_N + 1) / 2;
+    static constexpr uint8_t U_HIST = 64;       // filtered output history for the lags
+    // upper triangle of the symmetric A'A, row by row
+    static constexpr uint8_t pack(uint8_t i, uint8_t j) {
+        return i <= j ? i * MODEL_N - i * (i - 1) / 2 + (j - i) : pack(j, i);
+    }
+    float ls_ata[MODEL_LAGS][MODEL_PACK];
+    float ls_atb[MODEL_LAGS][MODEL_N];
+    float ls_btb[MODEL_LAGS];
+    float ls_sum_y;
+    uint32_t ls_count;
+    float u_hist[U_HIST];
+    uint8_t u_hist_idx;
+    uint8_t u_hist_len;
+    float sg_hist[U_HIST];
+    LowPassFilter2pFloat filt_u, filt_sg, filt_w, filt_q, filt_s;
+    float prev_wf;
+    float inj_amp;          // size of the injected signal
+    bool inj_scaled;        // size set from the probe period
+    float probe_w_sq;       // rate^2 summed over the probe period
+    uint32_t probe_n;
+    float rate_sq;          // rate^2 summed over the recording
+    uint32_t rate_n;
+
+    bool axis_weakened = false;   // tested axis's rate gains lowered for the test
+    Gains pre_weaken;             // its gains before that
+    uint8_t settle_halvings;      // times the rate gains were halved because the vehicle would not settle
+
+    void reset_model();
+    void weaken_axis_feedback();
+    void halve_rate_gains();
+    void restore_untuned();
+    void restore_axis_feedback();
+    void update_excite_model(uint32_t now_ms);
+    void finish_axis_model();
+    bool solve_model(uint8_t lag, float theta[MODEL_N], float &sse) const;
 
     AC_PID &rate_pid(Axis ax);
     AC_P &angle_p(Axis ax);

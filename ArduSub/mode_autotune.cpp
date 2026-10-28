@@ -29,6 +29,7 @@
 
 #define SUBTUNE_STILL_MS            2000    // time the vehicle must be still before each axis
 #define SUBTUNE_SETTLE_WARN_MS      15000   // warn if the vehicle has not settled after this long
+#define SUBTUNE_MODEL_HALVINGS      3       // most times the rate gains are halved if the vehicle will not settle
 #define SUBTUNE_OVERRIDE_MS         2000    // time sticks must be centred before tuning resumes
 #define SUBTUNE_FREQ_RATIO          3.0f    // second test frequency as a multiple of the first
 #define SUBTUNE_MIN_FIT             0.7f    // minimum fraction of the response the model must explain
@@ -37,8 +38,8 @@
 const AP_Param::GroupInfo SubTune::var_info[] = {
     // @Param: STYLE
     // @DisplayName: AutoTune style
-    // @Description: How AUTOTUNE mode tunes the vehicle. Gentle moves each axis through slow, small sine waves, fits a model of the vehicle's response in the water and calculates the gains from it. Twitch uses the Copter AutoTune twitches, configured with the AUTOTUNE_ parameters.
-    // @Values: 0:Twitch,1:Gentle
+    // @Description: How AUTOTUNE mode tunes the vehicle. Gentle moves each axis through slow, small sine waves, fits a model of the vehicle's response in the water and calculates the gains from it. Model adds the sine waves straight to the thrusters while the vehicle holds level, sized so the vehicle turns at ATUN_RATE, and fits a model with quadratic water drag and thruster lag; use it with MOT_THST_LIN so thrust follows the thruster output. Twitch uses the Copter AutoTune twitches, configured with the AUTOTUNE_ parameters.
+    // @Values: 0:Twitch,1:Gentle,2:Model
     // @User: Standard
     AP_GROUPINFO("STYLE", 1, SubTune, style, 1),
 
@@ -86,6 +87,21 @@ const AP_Param::GroupInfo SubTune::var_info[] = {
     // @Values: 0:Off,1:On
     // @User: Advanced
     AP_GROUPINFO("DIAG", 7, SubTune, diag, 0),
+
+    // @Param: RATE
+    // @DisplayName: Model AutoTune test rate
+    // @Description: Turn rate the Model style (ATUN_STYLE 2) sizes its test signal for, and the rate the water drag is linearised at for the gains. Larger rates fit better but move the vehicle more.
+    // @Units: deg/s
+    // @Range: 5 45
+    // @User: Advanced
+    AP_GROUPINFO("RATE", 8, SubTune, rate_dps, 15.0f),
+
+    // @Param: INJ_MAX
+    // @DisplayName: Model AutoTune largest test signal
+    // @Description: Largest test signal the Model style (ATUN_STYLE 2) adds to the thruster output, as a fraction of full output
+    // @Range: 0.05 0.8
+    // @User: Advanced
+    AP_GROUPINFO("INJ_MAX", 9, SubTune, inj_max, 0.4f),
 
     AP_GROUPEND
 };
@@ -286,6 +302,7 @@ bool SubTune::init()
     }
     tuned_loaded = false;
     aux_used = false;
+    settle_halvings = 0;
 
     if (!next_axis()) {
         GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "AutoTune: no axes selected in ATUN_AXES");
@@ -320,6 +337,7 @@ void SubTune::run()
     if (pilot_input || (pilot_override && now_ms - override_ms < SUBTUNE_OVERRIDE_MS)) {
         if (!pilot_override && step != Step::DONE) {
             // fly on the original gains while the pilot is in control
+            restore_axis_feedback();
             pilot_override = true;
             GCS_SEND_TEXT(MAV_SEVERITY_INFO, "AutoTune: pilot override, paused");
         }
@@ -349,11 +367,21 @@ void SubTune::run()
     sub.pos_control.D_set_pos_target_from_climb_rate_cms(climb_rate_cms);
     sub.pos_control.D_update_controller();
 
-    sub.mode_autotune.control_horizontal();
+    if (style == 2 && step == Step::EXCITE && axis == Axis::YAW && !pilot_override) {
+        // the horizontal thrusters are also the yaw thrusters: leave them to
+        // the yaw test, so each one's output is the yaw signal alone (with
+        // the dead band, a mix doesn't add up); position hold resumes after
+        sub.motors.set_forward(0.0f);
+        sub.motors.set_lateral(0.0f);
+    } else {
+        sub.mode_autotune.control_horizontal();
+    }
 }
 
 void SubTune::stop()
 {
+    restore_axis_feedback();
+    restore_untuned();
     if (tuned_loaded) {
         load_gains(false);
     }
@@ -535,6 +563,7 @@ bool SubTune::next_axis()
 
 void SubTune::start_settle(uint32_t now_ms)
 {
+    restore_axis_feedback();
     step = Step::SETTLE;
     step_start_ms = now_ms;
     still_start_ms = now_ms;
@@ -546,6 +575,10 @@ void SubTune::start_excite(uint32_t now_ms)
     step = Step::EXCITE;
     step_start_ms = now_ms;
     reset_sums();
+    reset_model();
+    if (style == 2) {
+        weaken_axis_feedback();
+    }
     GCS_SEND_TEXT(MAV_SEVERITY_INFO, "AutoTune: %s sine test %.0fs", axis_name(axis), double((cycles + 1) * period_s));
 }
 
@@ -575,6 +608,13 @@ void SubTune::update_settle(uint32_t now_ms)
         start_excite(now_ms);
         return;
     }
+    if (style == 2 && now_ms - step_start_ms > SUBTUNE_SETTLE_WARN_MS && settle_halvings < SUBTUNE_MODEL_HALVINGS) {
+        // the starting gains may be oscillating: the model test does not need
+        // them, so lower them for the rest of the tune
+        halve_rate_gains();
+        step_start_ms = now_ms;
+        return;
+    }
     if (now_ms - step_start_ms > SUBTUNE_SETTLE_WARN_MS && now_ms - last_msg_ms > 5000) {
         GCS_SEND_TEXT(MAV_SEVERITY_INFO, "AutoTune: waiting for vehicle to settle");
         last_msg_ms = now_ms;
@@ -593,6 +633,10 @@ float SubTune::excitation_rad(float t_s) const
 
 void SubTune::update_excite(uint32_t now_ms)
 {
+    if (style == 2) {
+        update_excite_model(now_ms);
+        return;
+    }
     const float period = MAX(period_s.get(), 1.0f);
     const float t_s = (now_ms - step_start_ms) * 0.001f;
     const float offset_rad = excitation_rad(t_s);
@@ -719,6 +763,10 @@ bool SubTune::fit_model(float &a, float &b, float &c, float &fit) const
 // fit the model and calculate the gains for the current axis
 void SubTune::finish_axis()
 {
+    if (style == 2) {
+        finish_axis_model();
+        return;
+    }
     const uint8_t i = uint8_t(axis);
     float a = 0.0f, b = 0.0f, c = 0.0f;
     float fit = 0.0f;
@@ -779,6 +827,434 @@ void SubTune::finish_axis()
     }
 
     step = Step::DONE;
+    restore_untuned();
+    load_gains(true);
+    GCS_SEND_TEXT(MAV_SEVERITY_NOTICE, "AutoTune: Success");
+}
+
+/*
+  model style (ATUN_STYLE 2)
+ */
+
+#define SUBTUNE_MODEL_FILT_HZ       5.0f    // low pass on every signal of the fit
+#define SUBTUNE_MODEL_LAG_STEP_S    0.005f  // lags tried: 0, 5, ... ms (thrusters plus the gyro filter)
+#define SUBTUNE_MODEL_WARMUP_S      0.5f    // let the filters settle before recording
+#define SUBTUNE_MODEL_INJ_START     0.15f   // test signal size for the probe period
+#define SUBTUNE_MODEL_FEEDBACK      0.2f    // tested axis's rate P, I and D during its test
+
+void SubTune::reset_model()
+{
+    memset(ls_ata, 0, sizeof(ls_ata));
+    memset(ls_atb, 0, sizeof(ls_atb));
+    memset(ls_btb, 0, sizeof(ls_btb));
+    ls_sum_y = 0.0f;
+    ls_count = 0;
+    memset(u_hist, 0, sizeof(u_hist));
+    memset(sg_hist, 0, sizeof(sg_hist));
+    u_hist_idx = 0;
+    u_hist_len = 0;
+    const float rate_hz = 1.0f / MAX(sub.G_Dt, 0.0005f);
+    filt_u.set_cutoff_frequency(rate_hz, SUBTUNE_MODEL_FILT_HZ);
+    filt_sg.set_cutoff_frequency(rate_hz, SUBTUNE_MODEL_FILT_HZ);
+    filt_w.set_cutoff_frequency(rate_hz, SUBTUNE_MODEL_FILT_HZ);
+    filt_q.set_cutoff_frequency(rate_hz, SUBTUNE_MODEL_FILT_HZ);
+    filt_s.set_cutoff_frequency(rate_hz, SUBTUNE_MODEL_FILT_HZ);
+    filt_u.reset();
+    filt_sg.reset();
+    filt_w.reset();
+    filt_q.reset();
+    filt_s.reset();
+    prev_wf = 0.0f;
+    inj_amp = MIN(SUBTUNE_MODEL_INJ_START, inj_max.get());
+    inj_scaled = false;
+    probe_w_sq = 0.0f;
+    probe_n = 0;
+    rate_sq = 0.0f;
+    rate_n = 0;
+}
+
+/*
+  hold level and add the test signal to the tested axis's output. The first
+  period (faded in) is a probe: its response sizes the signal so the vehicle
+  turns at about ATUN_RATE for the rest of the test, whatever the current
+  gains. Every sample after the filters settle goes into the fit, except
+  while the thrusters are saturated on this axis.
+ */
+void SubTune::update_excite_model(uint32_t now_ms)
+{
+    const float period = MAX(period_s.get(), 1.0f);
+    const float t_s = (now_ms - step_start_ms) * 0.001f;
+    const float omega = M_2PI / period;
+    AC_AttitudeControl_Sub &attitude_control = sub.attitude_control;
+
+    attitude_control.input_euler_angle_roll_pitch_yaw_rad(0.0f, 0.0f, hold_yaw_rad, true);
+
+    // the test signal
+    const float envelope = constrain_float(t_s / period, 0.0f, 1.0f);
+    const float inj = inj_amp * envelope * (0.6f * sinf(omega * t_s) + 0.4f * sinf(SUBTUNE_FREQ_RATIO * omega * t_s));
+    switch (axis) {
+    case Axis::ROLL:
+        attitude_control.actuator_roll_sysid(inj);
+        break;
+    case Axis::PITCH:
+        attitude_control.actuator_pitch_sysid(inj);
+        break;
+    case Axis::YAW:
+        attitude_control.actuator_yaw_sysid(inj);
+        break;
+    }
+
+    // what the vehicle did: output (incl. the signal, applied last loop),
+    // body rate and angle on this axis
+    const Vector3f gyro = sub.ahrs.get_gyro_latest();
+    float u, w, ang;
+    bool limited;
+    switch (axis) {
+    case Axis::ROLL:
+        u = sub.motors.get_roll() + sub.motors.get_roll_ff();
+        w = gyro.x;
+        ang = sub.ahrs.get_roll_rad();
+        limited = sub.motors.limit.roll;
+        break;
+    case Axis::PITCH:
+        u = sub.motors.get_pitch() + sub.motors.get_pitch_ff();
+        w = gyro.y;
+        ang = sub.ahrs.get_pitch_rad();
+        limited = sub.motors.limit.pitch;
+        break;
+    case Axis::YAW:
+    default:
+        u = sub.motors.get_yaw() + sub.motors.get_yaw_ff();
+        w = gyro.z;
+        ang = 0.0f;
+        limited = sub.motors.limit.yaw;
+        break;
+    }
+
+    // probe: second half of the first period, then size the signal
+    if (!inj_scaled) {
+        if (t_s > 0.5f * period) {
+            probe_w_sq += w * w;
+            probe_n++;
+        }
+        if (t_s >= period) {
+            // the probe ran at 50-100% envelope, about 75% on average, so
+            // the full signal would turn the vehicle about 1/0.75 times faster
+            const float probe_amp = sqrtf(2.0f * probe_w_sq / MAX(probe_n, 1U)) / 0.75f;
+            const float want = radians(constrain_float(rate_dps, 5.0f, 45.0f));
+            const float scale = want / MAX(probe_amp, radians(0.5f));
+            inj_amp = constrain_float(inj_amp * scale, 0.03f, constrain_float(inj_max, 0.05f, 0.8f));
+            inj_scaled = true;
+        }
+    }
+
+    // the same filter on every signal, so it cancels out of the fit; the
+    // nonlinear terms are formed before filtering
+    const float dt = sub.G_Dt;
+    const float uf = filt_u.apply(u);
+    const float sgf = filt_sg.apply(is_zero(u) ? 0.0f : (u > 0 ? 1.0f : -1.0f));
+    const float wf = filt_w.apply(w);
+    const float qf = filt_q.apply(fabsf(w) * w);
+    const float sf = filt_s.apply(sinf(ang));
+    const float accf = is_positive(dt) ? (wf - prev_wf) / dt : 0.0f;
+    prev_wf = wf;
+
+    u_hist[u_hist_idx] = uf;
+    sg_hist[u_hist_idx] = sgf;
+    u_hist_idx = (u_hist_idx + 1) % U_HIST;
+    if (u_hist_len < U_HIST) {
+        u_hist_len++;
+    }
+
+    if (t_s > SUBTUNE_MODEL_WARMUP_S && !limited && is_positive(dt)) {
+        rate_sq += w * w;
+        rate_n++;
+        for (uint8_t lag=0; lag<MODEL_LAGS; lag++) {
+            const uint8_t back = MIN(uint8_t(roundf(lag * SUBTUNE_MODEL_LAG_STEP_S / dt)), uint8_t(U_HIST - 1));
+            if (back >= u_hist_len) {
+                continue;
+            }
+            const uint8_t k = (u_hist_idx + U_HIST - 1 - back) % U_HIST;
+            const float phi[MODEL_N] { u_hist[k], sg_hist[k], -wf, -qf, -sf, 1.0f };
+            for (uint8_t r=0; r<MODEL_N; r++) {
+                for (uint8_t c=r; c<MODEL_N; c++) {
+                    ls_ata[lag][pack(r, c)] += phi[r] * phi[c];
+                }
+                ls_atb[lag][r] += phi[r] * accf;
+            }
+            ls_btb[lag] += accf * accf;
+        }
+        ls_sum_y += accf;
+        ls_count++;
+    }
+
+    if (t_s >= (cycles + 1) * period) {
+        switch (axis) {
+        case Axis::ROLL:
+            attitude_control.actuator_roll_sysid(0.0f);
+            break;
+        case Axis::PITCH:
+            attitude_control.actuator_pitch_sysid(0.0f);
+            break;
+        case Axis::YAW:
+            attitude_control.actuator_yaw_sysid(0.0f);
+            break;
+        }
+        finish_axis();
+    }
+}
+
+/*
+  least squares for one lag: theta = [a, e, b, b2, c, d]. Yaw has no
+  righting moment, so c is left out. Returns false if the problem is singular.
+ */
+bool SubTune::solve_model(uint8_t lag, float theta[MODEL_N], float &sse) const
+{
+    uint8_t idx[MODEL_N];
+    uint8_t n = 0;
+    for (uint8_t k=0; k<MODEL_N; k++) {
+        if (k == 4 && axis == Axis::YAW) {
+            continue;
+        }
+        idx[n++] = k;
+    }
+
+    // augmented, symmetric normal equations
+    float m[MODEL_N][MODEL_N + 1];
+    for (uint8_t r=0; r<n; r++) {
+        for (uint8_t c=0; c<n; c++) {
+            m[r][c] = ls_ata[lag][pack(idx[r], idx[c])];
+        }
+        m[r][n] = ls_atb[lag][idx[r]];
+    }
+
+    // Gaussian elimination with partial pivoting
+    for (uint8_t col=0; col<n; col++) {
+        uint8_t piv = col;
+        for (uint8_t r=col+1; r<n; r++) {
+            if (fabsf(m[r][col]) > fabsf(m[piv][col])) {
+                piv = r;
+            }
+        }
+        if (fabsf(m[piv][col]) < 1e-9f) {
+            return false;
+        }
+        if (piv != col) {
+            for (uint8_t c=0; c<=n; c++) {
+                const float tmp = m[col][c];
+                m[col][c] = m[piv][c];
+                m[piv][c] = tmp;
+            }
+        }
+        for (uint8_t r=col+1; r<n; r++) {
+            const float f = m[r][col] / m[col][col];
+            for (uint8_t c=col; c<=n; c++) {
+                m[r][c] -= f * m[col][c];
+            }
+        }
+    }
+    float x[MODEL_N];
+    for (int8_t r=n-1; r>=0; r--) {
+        float v = m[r][n];
+        for (uint8_t c=r+1; c<n; c++) {
+            v -= m[r][c] * x[c];
+        }
+        x[r] = v / m[r][r];
+    }
+
+    for (uint8_t k=0; k<MODEL_N; k++) {
+        theta[k] = 0.0f;
+    }
+    for (uint8_t r=0; r<n; r++) {
+        theta[idx[r]] = x[r];
+    }
+
+    // residual sum of squares: y'y - 2 theta'A'y + theta'A'A theta
+    float quad = 0.0f;
+    float lin = 0.0f;
+    for (uint8_t i=0; i<MODEL_N; i++) {
+        lin += theta[i] * ls_atb[lag][i];
+        for (uint8_t j=0; j<MODEL_N; j++) {
+            const float aij = ls_ata[lag][pack(i, j)];
+            quad += theta[i] * aij * theta[j];
+        }
+    }
+    sse = ls_btb[lag] - 2.0f * lin + quad;
+    return true;
+}
+
+/*
+  for the test the tested axis's rate loop is kept at SUBTUNE_MODEL_FEEDBACK
+  of its gains, so the thrusters follow the test signal rather than fighting
+  it (the attitude, depth and position holds keep working). The gains are put
+  back after the test, when the pilot takes over and when the tune stops.
+ */
+void SubTune::weaken_axis_feedback()
+{
+    if (axis_weakened) {
+        return;
+    }
+    pre_weaken = get_gains(axis);
+    AC_PID &pid = rate_pid(axis);
+    pid.set_kP(pre_weaken.rate_p * SUBTUNE_MODEL_FEEDBACK);
+    pid.set_kI(pre_weaken.rate_i * SUBTUNE_MODEL_FEEDBACK);
+    pid.set_kD(pre_weaken.rate_d * SUBTUNE_MODEL_FEEDBACK);
+    axis_weakened = true;
+}
+
+// put back the gains of axes without a tune if halve_rate_gains lowered them
+void SubTune::restore_untuned()
+{
+    if (settle_halvings == 0) {
+        return;
+    }
+    for (uint8_t i=0; i<3; i++) {
+        if (!have_tuned[i]) {
+            set_gains(Axis(i), orig[i]);
+        }
+    }
+    settle_halvings = 0;
+}
+
+// halve the rate gains of the axes not yet tuned; put back when the tune stops
+void SubTune::halve_rate_gains()
+{
+    for (uint8_t i=0; i<3; i++) {
+        if (have_tuned[i]) {
+            continue;
+        }
+        AC_PID &pid = rate_pid(Axis(i));
+        pid.set_kP(pid.kP() * 0.5f);
+        pid.set_kI(pid.kI() * 0.5f);
+        pid.set_kD(pid.kD() * 0.5f);
+    }
+    settle_halvings++;
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "AutoTune: not settling, rate gains halved for the test");
+}
+
+void SubTune::restore_axis_feedback()
+{
+    if (!axis_weakened) {
+        return;
+    }
+    set_gains(axis, pre_weaken);
+    axis_weakened = false;
+}
+
+// pick the thruster lag that fits best and calculate the gains from that model
+void SubTune::finish_axis_model()
+{
+    restore_axis_feedback();
+    const uint8_t i = uint8_t(axis);
+    // the lag that fits best, refined between the lags tried by a parabola
+    // through the residuals: the authority moves several percent per 5 ms of
+    // lag, because the output and the rate are tied together by the feedback
+    float sse_lag[MODEL_LAGS];
+    int8_t best_lag = -1;
+    for (uint8_t lag=0; lag<MODEL_LAGS; lag++) {
+        float theta[MODEL_N];
+        sse_lag[lag] = -1.0f;
+        if (ls_count > 100 && solve_model(lag, theta, sse_lag[lag]) && is_positive(theta[0])) {
+            if (best_lag < 0 || sse_lag[lag] < sse_lag[best_lag]) {
+                best_lag = lag;
+            }
+        } else {
+            sse_lag[lag] = -1.0f;
+        }
+    }
+    float best[MODEL_N] {};
+    float best_sse = 0.0f;
+    float lag_frac = 0.0f;
+    if (best_lag >= 0) {
+        solve_model(best_lag, best, best_sse);
+        if (best_lag > 0 && best_lag < MODEL_LAGS - 1 &&
+            sse_lag[best_lag - 1] >= 0.0f && sse_lag[best_lag + 1] >= 0.0f) {
+            const float s0 = sse_lag[best_lag - 1], s1 = sse_lag[best_lag], s2 = sse_lag[best_lag + 1];
+            const float curv = s0 - 2.0f * s1 + s2;
+            if (is_positive(curv)) {
+                lag_frac = constrain_float(0.5f * (s0 - s2) / curv, -0.5f, 0.5f);
+                float other[MODEL_N];
+                float other_sse;
+                if (solve_model(best_lag + (lag_frac > 0 ? 1 : -1), other, other_sse)) {
+                    const float w = fabsf(lag_frac);
+                    for (uint8_t k=0; k<MODEL_N; k++) {
+                        best[k] += w * (other[k] - best[k]);
+                    }
+                }
+            }
+        }
+    }
+    const float mean_y = ls_count > 0 ? ls_sum_y / ls_count : 0.0f;
+    const float var_y = ls_count > 0 ? ls_btb[MAX(best_lag, int8_t(0))] - ls_count * mean_y * mean_y : 0.0f;
+    const float fit = (best_lag >= 0 && is_positive(var_y)) ? 1.0f - best_sse / var_y : 0.0f;
+    const float a = best[0], e = best[1], b = best[2], b2 = best[3], c = best[4], d = best[5];
+    const float lag_s = MAX(best_lag + lag_frac, 0.0f) * SUBTUNE_MODEL_LAG_STEP_S;
+    const float rate_amp = sqrtf(2.0f * rate_sq / MAX(rate_n, 1U));
+
+    tuned[i] = orig[i];
+    if (best_lag < 0 || fit < SUBTUNE_MIN_FIT) {
+        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "AutoTune: %s fit poor (%.0f%%), gains unchanged", axis_name(axis), double(fit * 100.0f));
+        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "AutoTune: try a larger ATUN_RATE or ATUN_INJ_MAX");
+    } else {
+        // damping as a straight line at the design rate: the quadratic term
+        // b2*|w|*w has the same first harmonic as (8/(3*pi))*b2*W*w for a
+        // sine of amplitude W
+        const float w_ref = radians(constrain_float(rate_dps, 5.0f, 45.0f));
+        const float b_eq = MAX(b + 8.0f / (3.0f * M_PI) * MAX(b2, 0.0f) * w_ref, 0.0f);
+        const float omega = constrain_float(bandwidth, 1.0f, 15.0f);
+        tuned[i].rate_ff = constrain_float(b_eq / a, 0.0f, 2.0f);
+        tuned[i].rate_p = constrain_float(omega / a, 0.01f, 2.0f);
+        tuned[i].rate_i = constrain_float(0.25f * omega * tuned[i].rate_p, 0.0f, 2.0f);
+        tuned[i].angle_p = constrain_float((omega + b_eq) / 3.0f, 1.0f, 12.0f);
+        tuned[i].accel_radss = MAX(SUBTUNE_ACCEL_FRACTION * a, radians(10.0f));
+        have_tuned[i] = true;
+
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "AutoTune: %s model a=%.2f b=%.2f c=%.2f fit=%.0f%%",
+                      axis_name(axis), double(a), double(b_eq), double(c), double(fit * 100.0f));
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "AutoTune: %s drag b=%.2f b2=%.1f lag=%.0fms test=%.2f %.0fdps",
+                      axis_name(axis), double(b), double(b2), double(lag_s * 1000.0f), double(inj_amp), double(degrees(rate_amp)));
+        // the thrust step at zero output, as a fraction of full output:
+        // positive means thrust starts below MOT_SPIN_MIN, negative above it
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "AutoTune: %s dead band step %.1f%% of full output",
+                      axis_name(axis), double(100.0f * e / a));
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "AutoTune: %s P:%.3f I:%.3f FF:%.3f AngP:%.2f Accel:%.0f",
+                      axis_name(axis), double(tuned[i].rate_p), double(tuned[i].rate_i), double(tuned[i].rate_ff),
+                      double(tuned[i].angle_p), double(degrees(tuned[i].accel_radss)));
+    }
+
+#if HAL_LOGGING_ENABLED
+    // @LoggerMessage: SUBM
+    // @Description: Sub model AutoTune (ATUN_STYLE 2) result for one axis
+    // @Field: TimeUS: Time since system startup
+    // @Field: Ax: axis, 0:roll, 1:pitch, 2:yaw
+    // @Field: A: fitted thrust authority, angular acceleration per unit of output
+    // @Field: B: fitted linear damping
+    // @Field: B2: fitted quadratic damping
+    // @Field: C: fitted restoring moment
+    // @Field: E: fitted thrust step at zero output (dead band compensation error)
+    // @Field: D: fitted constant angular acceleration (trim, tether)
+    // @Field: Lag: thruster lag that fitted best
+    // @Field: Fit: fraction of the measured angular acceleration explained by the model
+    // @Field: Inj: size of the test signal
+    // @Field: W: rate amplitude during the test
+    // @Field: P: tuned rate P
+    // @Field: I: tuned rate I
+    // @Field: FF: tuned rate FF
+    // @Field: AngP: tuned angle P
+    AP::logger().Write("SUBM", "TimeUS,Ax,A,E,B,B2,C,D,Lag,Fit,Inj,W,P,I,FF,AngP", "QBffffffffffffff",
+                       AP_HAL::micros64(), i, a, e, b, b2, c, d, lag_s, fit, inj_amp, rate_amp,
+                       tuned[i].rate_p, tuned[i].rate_i, tuned[i].rate_ff, tuned[i].angle_p);
+#endif
+
+    axis_done[i] = true;
+    const uint32_t now_ms = AP_HAL::millis();
+    if (next_axis()) {
+        start_settle(now_ms);
+        return;
+    }
+
+    step = Step::DONE;
+    restore_untuned();
     load_gains(true);
     GCS_SEND_TEXT(MAV_SEVERITY_NOTICE, "AutoTune: Success");
 }
