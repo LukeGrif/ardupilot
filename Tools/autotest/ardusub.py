@@ -708,6 +708,64 @@ class AutoTestSub(vehicle_test_suite.TestSuite):
             if ngains[name] <= 0:
                 raise NotAchievedException("%s not tuned" % name)
 
+    def AutoTuneModel(self):
+        """Test the model AUTOTUNE style (ATUN_STYLE 2) gives the same gains from different starting gains"""
+        self.customise_SITL_commandline(
+            [],
+            model="vectored_6dof",
+            defaults_filepath=self.model_defaults_filepath("vectored_6dof"),
+            wipe=True,
+        )
+        # thrust linearisation for the SITL thrusters: thrust = out*|out|
+        # measured from 1500us, so SPIN_MIN 0 (the 1475-1525us ESC dead band
+        # leaves a small step at zero, which the tune fits)
+        self.set_parameters({
+            "MOT_THST_LIN": 1,
+            "MOT_SPIN_MIN": 0,
+            "MOT_SPIN_MAX": 1.0,
+            "MOT_THST_EXPO": 1.0,
+            "ATUN_STYLE": 2,
+        })
+        defaults = {
+            "ATC_RAT_RLL_P": 0.135, "ATC_RAT_RLL_I": 0.09, "ATC_ANG_RLL_P": 6.0,
+            "ATC_RAT_PIT_P": 0.135, "ATC_RAT_PIT_I": 0.09, "ATC_ANG_PIT_P": 6.0,
+            "ATC_RAT_YAW_P": 0.18, "ATC_RAT_YAW_I": 0.018, "ATC_ANG_YAW_P": 6.0,
+        }
+        tuned_names = ["ATC_RAT_RLL_P", "ATC_RAT_PIT_P", "ATC_RAT_YAW_P"]
+
+        def check_fit(mav, m):
+            if m.get_type() == 'STATUSTEXT' and "fit poor" in m.text:
+                raise NotAchievedException("Model fit failed: %s" % m.text)
+        self.install_message_hook_context(check_fit)
+
+        results = []
+        for factor in 0.5, 2.0:
+            self.progress("Tuning from %.1fx the default gains" % factor)
+            self.set_parameters({k: v * factor for k, v in defaults.items()})
+            self.context_collect('STATUSTEXT')
+            self.change_mode('ALT_HOLD')
+            self.wait_ready_to_arm()
+            self.arm_vehicle()
+            self.set_rc(Joystick.Throttle, 1300)
+            self.wait_altitude(altitude_min=-8, altitude_max=-6)
+            self.set_rc(Joystick.Throttle, 1500)
+            self.delay_sim_time(3)
+            tstart = self.get_sim_time()
+            self.change_mode(15)  # AUTOTUNE
+            self.wait_statustext("AutoTune: Success", timeout=600, check_context=True)
+            self.progress("AUTOTUNE OK (%u seconds)" % (self.get_sim_time() - tstart))
+            # disarming in AUTOTUNE saves the tuned gains
+            self.disarm_vehicle()
+            self.wait_statustext("AutoTune: Saved gains", check_context=True)
+            self.context_clear_collection('STATUSTEXT')
+            results.append(self.get_parameters(tuned_names))
+
+        for name in tuned_names:
+            a, b = results[0][name], results[1][name]
+            self.progress("%s: %.4f (from x0.5) %.4f (from x2)" % (name, a, b))
+            if max(a, b) / min(a, b) > 1.15:
+                raise NotAchievedException("%s depends on the starting gains: %.4f vs %.4f" % (name, a, b))
+
     def MotorThrustHoverParameterIgnore(self):
         """Test if we are ignoring MOT_THST_HOVER parameter"""
 
@@ -1447,6 +1505,7 @@ class AutoTestSub(vehicle_test_suite.TestSuite):
             self.PositionHold,
             self.AutoTune,
             self.AutoTuneGentle,
+            self.AutoTuneModel,
             self.ModeChanges,
             self.MAV_mgs,
             self.DiveMission,
