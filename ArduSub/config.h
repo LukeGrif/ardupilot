@@ -162,6 +162,10 @@
 //////////////////////////////////////////////////////////////////////////////
 // PosHold parameter defaults
 //
+#ifndef AUTOTUNE_ENABLED
+# define AUTOTUNE_ENABLED              AC_AUTOTUNE_ENABLED // AutoTune flight mode enabled by default
+#endif
+
 #ifndef POSHOLD_ENABLED
 # define POSHOLD_ENABLED               1 // PosHold flight mode enabled by default
 #endif

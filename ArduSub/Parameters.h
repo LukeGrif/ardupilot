@@ -416,6 +416,11 @@ public:
     AP_Float dyn_angle_max;
     AP_Float dyn_att_timeout;
     AP_Int8 dyn_bt_enable;
+
+#if AUTOTUNE_ENABLED
+    // we need a pointer to autotune for the G2 table
+    void *autotune_ptr;
+#endif
 };
 
 extern const AP_Param::Info        var_info[];

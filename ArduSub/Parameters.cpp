@@ -116,7 +116,7 @@ const AP_Param::Info Sub::var_info[] = {
     // @Param: FLTMODE1
     // @DisplayName: Flight Mode 1
     // @Description: Flight mode when pwm of Flightmode channel(FLTMODE_CH) is <= 1230
-    // @Values: 0:Stabilize,1:Acro,2:AltHold,3:Auto,4:Guided,7:Circle,9:Surface,16:PosHold,19:Manual,20:Motor Detect,21:SurfTrak
+    // @Values: 0:Stabilize,1:Acro,2:AltHold,3:Auto,4:Guided,7:Circle,9:Surface,15:AutoTune,16:PosHold,19:Manual,20:Motor Detect,21:SurfTrak,22:Dynamic
     // @User: Standard
     GSCALAR(flight_mode1, "FLTMODE1",               (uint8_t)FLIGHT_MODE_1),
 
@@ -806,6 +806,12 @@ const AP_Param::GroupInfo ParametersG2::var_info[] = {
     // @User: Standard
     AP_GROUPINFO("DYN_BT_ENABLE", 28, ParametersG2, dyn_bt_enable, 0),
 
+#if AUTOTUNE_ENABLED
+    // @Group: AUTOTUNE_
+    // @Path: ../libraries/AC_AutoTune/AC_AutoTune_Multi.cpp
+    AP_SUBGROUPPTR(autotune_ptr, "AUTOTUNE_", 29, ParametersG2, AutoTune),
+#endif
+
     AP_GROUPEND
 };
 
@@ -813,6 +819,9 @@ const AP_Param::GroupInfo ParametersG2::var_info[] = {
   constructor for g2 object
  */
 ParametersG2::ParametersG2()
+#if AUTOTUNE_ENABLED
+    : autotune_ptr(&sub.mode_autotune.autotune)
+#endif
 {
     AP_Param::setup_object_defaults(this, var_info);
 }

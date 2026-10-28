@@ -46,6 +46,7 @@
 #include <AP_Mission/AP_Mission.h>         // Mission command library
 #include <AC_AttitudeControl/AC_AttitudeControl_Sub.h> // Attitude control library
 #include <AC_AttitudeControl/AC_PosControl.h>      // Position control library
+#include <AC_AutoTune/AC_AutoTune_Multi.h>  // attitude gain autotune library
 #include <AP_Motors/AP_Motors.h>          // AP Motors library
 #include <Filter/Filter.h>             // Filter library
 #include <AP_Relay/AP_Relay.h>           // APM relay
@@ -122,6 +123,8 @@ public:
     friend class ModeSurface;
     friend class ModeMotordetect;
     friend class ModeDynamic;
+    friend class ModeAutotune;
+    friend class AutoTune;
 
     Sub(void);
 
@@ -632,6 +635,9 @@ private:
     ModeMotordetect mode_motordetect;
     ModeSurftrak mode_surftrak;
     ModeDynamic mode_dynamic;
+#if AUTOTUNE_ENABLED
+    ModeAutotune mode_autotune;
+#endif
 
     // Auto
     AutoSubMode auto_mode;   // controls which auto controller is run
