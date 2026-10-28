@@ -282,6 +282,9 @@ void Sub::twentyfive_hz_logging()
 // Full rate logging of IMU
 void Sub::loop_rate_logging()
 {
+#if AUTOTUNE_ENABLED
+    mode_autotune.subtune.log_diag();
+#endif
     if (should_log(MASK_LOG_IMU_FAST)) {
         AP::ins().Write_IMU();
     }

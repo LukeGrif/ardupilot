@@ -80,6 +80,13 @@ const AP_Param::GroupInfo SubTune::var_info[] = {
     // @User: Advanced
     AP_GROUPINFO("BW", 6, SubTune, bandwidth, 4.0f),
 
+    // @Param: DIAG
+    // @DisplayName: AutoTune diagnostic log
+    // @Description: Log the rate controller outputs, body rates, attitude and thruster outputs at the loop rate (SUTD and SUTM messages) while armed in AUTOTUNE or MANUAL, for studying the tune offline. Uses a lot of log space.
+    // @Values: 0:Off,1:On
+    // @User: Advanced
+    AP_GROUPINFO("DIAG", 7, SubTune, diag, 0),
+
     AP_GROUPEND
 };
 
@@ -202,6 +209,49 @@ void AutoTune::do_post_test_gcs_announcements()
 bool AutoTune::position_ok()
 {
     return sub.position_ok();
+}
+
+/*
+  loop-rate diagnostic log (ATUN_DIAG=1), armed in AUTOTUNE or MANUAL:
+    SUTD: St (gentle step: 0 settle, 1 excite, 2 done, 9 other mode),
+          Ax (axis), UR/UP/UY (rate controller outputs incl. FF),
+          GX/GY/GZ (body rates), Rl/Pt/Yw (attitude), Lim (motor limit
+          flags: 1 roll, 2 pitch, 4 yaw, 8 throttle)
+    SUTM: thruster outputs M1..M8 (PWM)
+ */
+void SubTune::log_diag() const
+{
+#if HAL_LOGGING_ENABLED
+    if (diag <= 0 || !sub.motors.armed()) {
+        return;
+    }
+    const bool in_tune = sub.control_mode == Mode::Number::AUTOTUNE;
+    if (!in_tune && sub.control_mode != Mode::Number::MANUAL) {
+        return;
+    }
+    const uint64_t now_us = AP_HAL::micros64();
+    const Vector3f gyro = sub.ahrs.get_gyro_latest();
+    const AP_Motors6DOF &m = sub.motors;
+    const uint8_t lim = (m.limit.roll ? 1 : 0) | (m.limit.pitch ? 2 : 0) |
+                        (m.limit.yaw ? 4 : 0) | (m.limit.throttle_upper || m.limit.throttle_lower ? 8 : 0);
+    AP::logger().WriteStreaming("SUTD", "TimeUS,St,Ax,UR,UP,UY,GX,GY,GZ,Rl,Pt,Yw,Lim",
+                                "QBBfffffffffB",
+                                now_us,
+                                uint8_t(in_tune && use_sine_style() ? uint8_t(step) : 9),
+                                uint8_t(axis),
+                                m.get_roll() + m.get_roll_ff(),
+                                m.get_pitch() + m.get_pitch_ff(),
+                                m.get_yaw() + m.get_yaw_ff(),
+                                gyro.x, gyro.y, gyro.z,
+                                sub.ahrs.get_roll_rad(), sub.ahrs.get_pitch_rad(), sub.ahrs.get_yaw_rad(),
+                                lim);
+    uint16_t pwm[8];
+    for (uint8_t i=0; i<8; i++) {
+        pwm[i] = hal.rcout->read(i);
+    }
+    AP::logger().WriteStreaming("SUTM", "TimeUS,M1,M2,M3,M4,M5,M6,M7,M8", "QHHHHHHHH",
+                                now_us, pwm[0], pwm[1], pwm[2], pwm[3], pwm[4], pwm[5], pwm[6], pwm[7]);
+#endif
 }
 
 /*

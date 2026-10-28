@@ -601,6 +601,9 @@ public:
     void disarmed(bool in_autotune_mode);
     void do_aux_function(RC_Channel::AuxSwitchPos ch_flag);
 
+    // loop-rate diagnostic log for studying the tune (ATUN_DIAG)
+    void log_diag() const;
+
 private:
     enum class Axis : uint8_t { ROLL = 0, PITCH = 1, YAW = 2 };
     enum class Step : uint8_t { SETTLE, EXCITE, DONE };
@@ -617,6 +620,7 @@ private:
     AP_Float period_s;
     AP_Int8 cycles;
     AP_Float bandwidth;
+    AP_Int8 diag;
 
     Step step;
     Axis axis;
