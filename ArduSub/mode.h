@@ -654,7 +654,7 @@ private:
     // e is the thrust step left at zero output by an imperfect dead band
     // compensation (MOT_SPIN_MIN)
     static constexpr uint8_t MODEL_N = 6;       // a, e, b, b2, c, d
-    static constexpr uint8_t MODEL_LAGS = 13;   // 0, 5, ... 60 ms
+    static constexpr uint8_t MODEL_LAGS = 25;   // 0, 5, ... 120 ms
     static constexpr uint8_t MODEL_PACK = MODEL_N * (MODEL_N + 1) / 2;
     static constexpr uint8_t U_HIST = 64;       // filtered output history for the lags
     // upper triangle of the symmetric A'A, row by row
@@ -682,6 +682,9 @@ private:
     bool axis_weakened = false;   // tested axis's rate gains lowered for the test
     Gains pre_weaken;             // its gains before that
     uint8_t settle_halvings;      // times the rate gains were halved because the vehicle would not settle
+    float model_dt;               // measured loop period for the model fit, s
+    float ref_lag_sum;            // lags found on pitch and yaw, s: roll uses their mean
+    uint8_t ref_lag_n;
 
     void reset_model();
     void weaken_axis_feedback();

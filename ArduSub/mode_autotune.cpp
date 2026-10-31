@@ -303,6 +303,8 @@ bool SubTune::init()
     tuned_loaded = false;
     aux_used = false;
     settle_halvings = 0;
+    ref_lag_sum = 0.0f;
+    ref_lag_n = 0;
 
     if (!next_axis()) {
         GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "AutoTune: no axes selected in ATUN_AXES");
@@ -552,7 +554,12 @@ void SubTune::save_gains()
 // select the next axis to tune, returns false when all are done
 bool SubTune::next_axis()
 {
-    for (uint8_t i=0; i<3; i++) {
+    // the model style does pitch and yaw first, so roll can use their lag
+    static const uint8_t order_model[3] { 1, 2, 0 };
+    static const uint8_t order_other[3] { 0, 1, 2 };
+    const uint8_t *order = style == 2 ? order_model : order_other;
+    for (uint8_t n=0; n<3; n++) {
+        const uint8_t i = order[n];
         if ((axes & (1U<<i)) && !axis_done[i]) {
             axis = Axis(i);
             return true;
@@ -837,7 +844,7 @@ void SubTune::finish_axis()
  */
 
 #define SUBTUNE_MODEL_FILT_HZ       5.0f    // low pass on every signal of the fit
-#define SUBTUNE_MODEL_LAG_STEP_S    0.005f  // lags tried: 0, 5, ... ms (thrusters plus the gyro filter)
+#define SUBTUNE_MODEL_LAG_STEP_S    0.005f  // lags tried: 0, 5, ... 120 ms (thrusters, gyro filter, simulator frames)
 #define SUBTUNE_MODEL_WARMUP_S      0.5f    // let the filters settle before recording
 #define SUBTUNE_MODEL_INJ_START     0.15f   // test signal size for the probe period
 #define SUBTUNE_MODEL_FEEDBACK      0.2f    // tested axis's rate P, I and D during its test
@@ -853,7 +860,15 @@ void SubTune::reset_model()
     memset(sg_hist, 0, sizeof(sg_hist));
     u_hist_idx = 0;
     u_hist_len = 0;
-    const float rate_hz = 1.0f / MAX(sub.G_Dt, 0.0005f);
+    // the loop rate the vehicle actually runs at: in a simulator stepped by
+    // its physics (BlueSim: 200 Hz) or on a busy board it can be well below
+    // the scheduled rate that G_Dt assumes
+    float rate_hz = AP::scheduler().get_filtered_loop_rate_hz();
+    if (!is_positive(rate_hz)) {
+        rate_hz = 1.0f / MAX(sub.G_Dt, 0.0005f);
+    }
+    rate_hz = constrain_float(rate_hz, 20.0f, 2000.0f);
+    model_dt = 1.0f / rate_hz;
     filt_u.set_cutoff_frequency(rate_hz, SUBTUNE_MODEL_FILT_HZ);
     filt_sg.set_cutoff_frequency(rate_hz, SUBTUNE_MODEL_FILT_HZ);
     filt_w.set_cutoff_frequency(rate_hz, SUBTUNE_MODEL_FILT_HZ);
@@ -950,7 +965,7 @@ void SubTune::update_excite_model(uint32_t now_ms)
 
     // the same filter on every signal, so it cancels out of the fit; the
     // nonlinear terms are formed before filtering
-    const float dt = sub.G_Dt;
+    const float dt = model_dt;
     const float uf = filt_u.apply(u);
     const float sgf = filt_sg.apply(is_zero(u) ? 0.0f : (u > 0 ? 1.0f : -1.0f));
     const float wf = filt_w.apply(w);
@@ -1147,8 +1162,10 @@ void SubTune::finish_axis_model()
     restore_axis_feedback();
     const uint8_t i = uint8_t(axis);
     // the lag that fits best, refined between the lags tried by a parabola
-    // through the residuals: the authority moves several percent per 5 ms of
-    // lag, because the output and the rate are tied together by the feedback
+    // through the residuals: the authority moves several percent per few ms of
+    // lag, because the output and the rate are tied together by the feedback.
+    // The lag (thrusters, gyro filter) is the same on every axis, and roll's
+    // fit pins it down least well, so roll uses the mean of pitch and yaw's
     float sse_lag[MODEL_LAGS];
     int8_t best_lag = -1;
     for (uint8_t lag=0; lag<MODEL_LAGS; lag++) {
@@ -1162,24 +1179,35 @@ void SubTune::finish_axis_model()
             sse_lag[lag] = -1.0f;
         }
     }
+    const bool lag_shared = axis == Axis::ROLL && ref_lag_n > 0 && best_lag >= 0;
+    float lag_frac = 0.0f;
+    if (lag_shared) {
+        const float pos = constrain_float(ref_lag_sum / ref_lag_n / SUBTUNE_MODEL_LAG_STEP_S, 0.0f, MODEL_LAGS - 1.0f);
+        best_lag = int8_t(MIN(uint8_t(pos), uint8_t(MODEL_LAGS - 2)));
+        lag_frac = pos - best_lag;
+    }
     float best[MODEL_N] {};
     float best_sse = 0.0f;
-    float lag_frac = 0.0f;
     if (best_lag >= 0) {
         solve_model(best_lag, best, best_sse);
-        if (best_lag > 0 && best_lag < MODEL_LAGS - 1 &&
+        if (!lag_shared && best_lag > 0 && best_lag < MODEL_LAGS - 1 &&
             sse_lag[best_lag - 1] >= 0.0f && sse_lag[best_lag + 1] >= 0.0f) {
             const float s0 = sse_lag[best_lag - 1], s1 = sse_lag[best_lag], s2 = sse_lag[best_lag + 1];
             const float curv = s0 - 2.0f * s1 + s2;
             if (is_positive(curv)) {
                 lag_frac = constrain_float(0.5f * (s0 - s2) / curv, -0.5f, 0.5f);
-                float other[MODEL_N];
-                float other_sse;
-                if (solve_model(best_lag + (lag_frac > 0 ? 1 : -1), other, other_sse)) {
-                    const float w = fabsf(lag_frac);
-                    for (uint8_t k=0; k<MODEL_N; k++) {
-                        best[k] += w * (other[k] - best[k]);
-                    }
+            }
+        }
+        if (!is_zero(lag_frac)) {
+            float other[MODEL_N];
+            float other_sse;
+            if (solve_model(best_lag + (lag_frac > 0 ? 1 : -1), other, other_sse)) {
+                const float w = fabsf(lag_frac);
+                for (uint8_t k=0; k<MODEL_N; k++) {
+                    best[k] += w * (other[k] - best[k]);
+                }
+                if (lag_shared) {
+                    best_sse += w * (other_sse - best_sse);
                 }
             }
         }
@@ -1207,12 +1235,19 @@ void SubTune::finish_axis_model()
         tuned[i].rate_i = constrain_float(0.25f * omega * tuned[i].rate_p, 0.0f, 2.0f);
         tuned[i].angle_p = constrain_float((omega + b_eq) / 3.0f, 1.0f, 12.0f);
         tuned[i].accel_radss = MAX(SUBTUNE_ACCEL_FRACTION * a, radians(10.0f));
+        // the gains above are designed without D
+        tuned[i].rate_d = 0.0f;
         have_tuned[i] = true;
+        if (!lag_shared && axis != Axis::ROLL) {
+            ref_lag_sum += lag_s;
+            ref_lag_n++;
+        }
 
         GCS_SEND_TEXT(MAV_SEVERITY_INFO, "AutoTune: %s model a=%.2f b=%.2f c=%.2f fit=%.0f%%",
                       axis_name(axis), double(a), double(b_eq), double(c), double(fit * 100.0f));
-        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "AutoTune: %s drag b=%.2f b2=%.1f lag=%.0fms test=%.2f %.0fdps",
-                      axis_name(axis), double(b), double(b2), double(lag_s * 1000.0f), double(inj_amp), double(degrees(rate_amp)));
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "AutoTune: %s drag b=%.2f b2=%.1f lag=%.0fms%s test=%.2f %.0fdps",
+                      axis_name(axis), double(b), double(b2), double(lag_s * 1000.0f), lag_shared ? "(P/Y)" : "",
+                      double(inj_amp), double(degrees(rate_amp)));
         // the thrust step at zero output, as a fraction of full output:
         // positive means thrust starts below MOT_SPIN_MIN, negative above it
         GCS_SEND_TEXT(MAV_SEVERITY_INFO, "AutoTune: %s dead band step %.1f%% of full output",
