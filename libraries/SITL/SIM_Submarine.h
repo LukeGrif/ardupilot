@@ -98,7 +98,7 @@ protected:
     // calculate rotational and linear accelerations
     void calculate_forces(const struct sitl_input &input, Vector3f &rot_accel, Vector3f &body_accel);
     // measured T200 thrust (N) for an ESC pulse width
-    static float t200_thrust_N(int16_t pwm);
+    float t200_thrust_N(int16_t pwm) const;
     bool t200_thrust;
     // calculate buoyancy
     float calculate_buoyancy_acceleration();
