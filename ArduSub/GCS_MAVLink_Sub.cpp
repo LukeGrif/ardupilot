@@ -79,6 +79,48 @@ void GCS_MAVLINK_Sub::send_banner()
     send_text(MAV_SEVERITY_INFO, "Frame: %s", sub.motors.get_frame_string());
 }
 
+/*
+  send the position controller's target (the path it is following, after its
+  speed and acceleration limits; acceleration is the controller's demand) so
+  a GCS can graph it against
+  LOCAL_POSITION_NED and see overshoot. Horizontal and vertical are reported
+  only while that part of the controller is running (e.g. vertical only in
+  ALT_HOLD); the rest are marked ignored.
+*/
+void GCS_MAVLINK_Sub::send_position_target_local_ned()
+{
+    const AC_PosControl &pos_control = sub.pos_control;
+    const bool ne = pos_control.NE_is_active();
+    const bool d = pos_control.D_is_active();
+    if (!ne && !d) {
+        return;
+    }
+    uint16_t type_mask = POSITION_TARGET_TYPEMASK_YAW_IGNORE | POSITION_TARGET_TYPEMASK_YAW_RATE_IGNORE;
+    if (!ne) {
+        type_mask |= POSITION_TARGET_TYPEMASK_X_IGNORE | POSITION_TARGET_TYPEMASK_Y_IGNORE |
+                     POSITION_TARGET_TYPEMASK_VX_IGNORE | POSITION_TARGET_TYPEMASK_VY_IGNORE |
+                     POSITION_TARGET_TYPEMASK_AX_IGNORE | POSITION_TARGET_TYPEMASK_AY_IGNORE;
+    }
+    if (!d) {
+        type_mask |= POSITION_TARGET_TYPEMASK_Z_IGNORE | POSITION_TARGET_TYPEMASK_VZ_IGNORE |
+                     POSITION_TARGET_TYPEMASK_AZ_IGNORE;
+    }
+    // the planned path: position target, and the path's own speed (not the
+    // velocity target, which adds the position loop's correction)
+    const Vector3p &pos = pos_control.get_pos_target_NED_m();
+    const Vector3f vel = pos_control.get_vel_desired_NED_ms() + pos_control.get_vel_offset_NED_ms();
+    const Vector3f &accel = pos_control.get_accel_target_NED_mss();
+    mavlink_msg_position_target_local_ned_send(
+        chan,
+        AP_HAL::millis(),
+        MAV_FRAME_LOCAL_NED,
+        type_mask,
+        ne ? pos.x : 0.0f, ne ? pos.y : 0.0f, d ? pos.z : 0.0f,
+        ne ? vel.x : 0.0f, ne ? vel.y : 0.0f, d ? vel.z : 0.0f,
+        ne ? accel.x : 0.0f, ne ? accel.y : 0.0f, d ? accel.z : 0.0f,
+        0.0f, 0.0f);
+}
+
 void GCS_MAVLINK_Sub::send_nav_controller_output() const
 {
     const Vector3f &targets = sub.attitude_control.get_att_target_euler_cd();

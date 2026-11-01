@@ -29,6 +29,7 @@ protected:
     void send_banner() override;
 
     void send_nav_controller_output() const override;
+    void send_position_target_local_ned() override;
     void send_pid_tuning() override;
     void send_attitude_target() override;
 
