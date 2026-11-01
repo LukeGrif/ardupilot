@@ -636,6 +636,8 @@ private:
 
     uint32_t step_start_ms;
     uint32_t still_start_ms;
+    float still_roll_rad, still_pitch_rad; // attitude when it last started being still
+    float settle_peak_rate_rads;  // largest turn rate while waiting to settle
     uint32_t override_ms;
     uint32_t last_msg_ms;
     bool pilot_override;

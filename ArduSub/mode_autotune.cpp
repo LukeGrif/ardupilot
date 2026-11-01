@@ -29,6 +29,10 @@
 
 #define SUBTUNE_STILL_MS            2000    // time the vehicle must be still before each axis
 #define SUBTUNE_SETTLE_WARN_MS      15000   // warn if the vehicle has not settled after this long
+#define SUBTUNE_STILL_RATE_DPS      5.0f    // turn rate below this counts as still
+#define SUBTUNE_STILL_DRIFT_DEG     2.0f    // roll and pitch may change this much while still
+#define SUBTUNE_STILL_TILT_DEG      20.0f   // a steady lean from trim up to this is accepted
+#define SUBTUNE_OSCILLATING_DPS     15.0f   // a turn rate peak above this while settling means oscillation
 #define SUBTUNE_MODEL_HALVINGS      3       // most times the rate gains are halved if the vehicle will not settle
 #define SUBTUNE_OVERRIDE_MS         2000    // time sticks must be centred before tuning resumes
 #define SUBTUNE_FREQ_RATIO          3.0f    // second test frequency as a multiple of the first
@@ -574,6 +578,9 @@ void SubTune::start_settle(uint32_t now_ms)
     step = Step::SETTLE;
     step_start_ms = now_ms;
     still_start_ms = now_ms;
+    still_roll_rad = sub.ahrs.get_roll_rad();
+    still_pitch_rad = sub.ahrs.get_pitch_rad();
+    settle_peak_rate_rads = 0.0f;
     last_msg_ms = now_ms;
 }
 
@@ -598,33 +605,50 @@ void SubTune::reset_sums()
     record_s = 0.0f;
 }
 
-// hold level at the starting heading until the vehicle is still
+// hold level at the starting heading until the vehicle is still: turning
+// slowly and not changing attitude. A steady lean from the trim (ballast)
+// is accepted, since the tests measure motion about it and the model's
+// offset term takes the trim's torque
 void SubTune::update_settle(uint32_t now_ms)
 {
     sub.attitude_control.input_euler_angle_roll_pitch_yaw_rad(0.0f, 0.0f, hold_yaw_rad, true);
 
     const AP_AHRS &ahrs = sub.ahrs;
-    const bool still = fabsf(ahrs.get_roll_rad()) < radians(3) &&
-                       fabsf(ahrs.get_pitch_rad()) < radians(3) &&
-                       fabsf(wrap_PI(ahrs.get_yaw_rad() - hold_yaw_rad)) < radians(5) &&
-                       ahrs.get_gyro().length() < radians(5);
+    const float roll = ahrs.get_roll_rad();
+    const float pitch = ahrs.get_pitch_rad();
+    const float rate = ahrs.get_gyro().length();
+    settle_peak_rate_rads = MAX(settle_peak_rate_rads, rate);
+    const bool still = rate < radians(SUBTUNE_STILL_RATE_DPS) &&
+                       fabsf(roll) < radians(SUBTUNE_STILL_TILT_DEG) &&
+                       fabsf(pitch) < radians(SUBTUNE_STILL_TILT_DEG) &&
+                       fabsf(roll - still_roll_rad) < radians(SUBTUNE_STILL_DRIFT_DEG) &&
+                       fabsf(pitch - still_pitch_rad) < radians(SUBTUNE_STILL_DRIFT_DEG);
     if (!still) {
         still_start_ms = now_ms;
+        still_roll_rad = roll;
+        still_pitch_rad = pitch;
     }
     if (now_ms - still_start_ms > SUBTUNE_STILL_MS) {
         start_excite(now_ms);
         return;
     }
-    if (style == 2 && now_ms - step_start_ms > SUBTUNE_SETTLE_WARN_MS && settle_halvings < SUBTUNE_MODEL_HALVINGS) {
-        // the starting gains may be oscillating: the model test does not need
-        // them, so lower them for the rest of the tune
-        halve_rate_gains();
-        step_start_ms = now_ms;
+    if (now_ms - step_start_ms <= SUBTUNE_SETTLE_WARN_MS) {
         return;
     }
-    if (now_ms - step_start_ms > SUBTUNE_SETTLE_WARN_MS && now_ms - last_msg_ms > 5000) {
-        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "AutoTune: waiting for vehicle to settle");
+    if (style == 2 && settle_peak_rate_rads > radians(SUBTUNE_OSCILLATING_DPS) &&
+        settle_halvings < SUBTUNE_MODEL_HALVINGS) {
+        // the starting gains look to be oscillating: the model test does not
+        // need them, so lower them for the rest of the tune
+        halve_rate_gains();
+        step_start_ms = now_ms;
+        settle_peak_rate_rads = 0.0f;
+        return;
+    }
+    if (now_ms - last_msg_ms > 5000) {
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "AutoTune: waiting to settle: roll %.0f pitch %.0f deg, turning %.0f deg/s",
+                      double(degrees(roll)), double(degrees(pitch)), double(degrees(rate)));
         last_msg_ms = now_ms;
+        settle_peak_rate_rads = 0.0f;
     }
 }
 
