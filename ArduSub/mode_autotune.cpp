@@ -870,7 +870,8 @@ void SubTune::finish_axis()
 #define SUBTUNE_MODEL_FILT_HZ       5.0f    // low pass on every signal of the fit
 #define SUBTUNE_MODEL_LAG_STEP_S    0.005f  // lags tried: 0, 5, ... 120 ms (thrusters, gyro filter, simulator frames)
 #define SUBTUNE_MODEL_WARMUP_S      0.5f    // let the filters settle before recording
-#define SUBTUNE_MODEL_INJ_START     0.15f   // test signal size for the probe period
+#define SUBTUNE_MODEL_INJ_START     0.06f   // test signal size for the probe period (small: linearised thrusters are strong)
+#define SUBTUNE_MODEL_INJ_MIN       0.01f   // smallest test signal after the probe
 #define SUBTUNE_MODEL_FEEDBACK      0.2f    // tested axis's rate P, I and D during its test
 
 void SubTune::reset_model()
@@ -982,7 +983,7 @@ void SubTune::update_excite_model(uint32_t now_ms)
             const float probe_amp = sqrtf(2.0f * probe_w_sq / MAX(probe_n, 1U)) / 0.75f;
             const float want = radians(constrain_float(rate_dps, 5.0f, 45.0f));
             const float scale = want / MAX(probe_amp, radians(0.5f));
-            inj_amp = constrain_float(inj_amp * scale, 0.03f, constrain_float(inj_max, 0.05f, 0.8f));
+            inj_amp = constrain_float(inj_amp * scale, SUBTUNE_MODEL_INJ_MIN, constrain_float(inj_max, 0.05f, 0.8f));
             inj_scaled = true;
         }
     }
