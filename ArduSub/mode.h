@@ -625,6 +625,7 @@ private:
     AP_Float rate_dps;
     AP_Float inj_max;
     AP_Int8 check;
+    AP_Int8 bw_auto;
 
     Step step;
     Axis axis;
@@ -713,6 +714,26 @@ private:
     float check_lp;             // low-passed rate output, for the chatter
     float check_alpha;
     float check_hold_yaw_rad;
+
+    // response speed (model style): fixed ATUN_BW, or with ATUN_BW_AUTO
+    // calculated per axis from what the test measured: the lag, the gyro
+    // noise while still, and the thrust authority
+    enum class BWLimit : uint8_t { FIXED, DELAY, NOISE, THRUST, MIN, MAX };
+    float noise_lp[3];          // gyro low-passed, rad/s, to take out slow motion
+    float noise_sq[3];          // gyro noise squared, summed while still
+    uint32_t noise_n;
+    float noise_rads[3];        // gyro noise measured in the last still period, RMS rad/s
+    bool have_noise;
+    float model_a[3];           // per axis: authority and linearised damping, for the gains
+    float model_beq[3];
+    float axis_bw[3];           // response speed the gains were designed for, rad/s
+    BWLimit axis_bw_limit[3];
+    uint8_t bw_backoffs[3];     // times the check made the gains gentler (BW or I lowered)
+    float i_scale[3];           // rate I relative to the design, halved for plain overshoot
+
+    float choose_bw(uint8_t i, float a, float lag_s);
+    void design_gains(uint8_t i);
+    static const char *bw_limit_name(BWLimit lim);
 
     void start_check(uint32_t now_ms);
     void start_check_run(uint32_t now_ms);

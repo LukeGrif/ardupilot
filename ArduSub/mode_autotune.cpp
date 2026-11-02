@@ -38,6 +38,14 @@
 #define SUBTUNE_FREQ_RATIO          3.0f    // second test frequency as a multiple of the first
 #define SUBTUNE_MIN_FIT             0.7f    // minimum fraction of the response the model must explain
 #define SUBTUNE_ACCEL_FRACTION      0.5f    // fraction of the measured authority used for the accel limit
+#define SUBTUNE_NOISE_HZ            2.0f    // gyro noise: what is left above this frequency while still
+#define SUBTUNE_BW_DELAY            0.5f    // calculated BW at most this / lag: about 60 deg phase margin
+#define SUBTUNE_BW_NOISE_OUT        0.02f   // gyro noise times rate P at most this, fraction of full output
+#define SUBTUNE_BW_THRUST_OUT       0.5f    // a turn at ATUN_RATE needs at most this, fraction of full output
+#define SUBTUNE_BW_MIN              1.0f
+#define SUBTUNE_BW_MAX              15.0f
+#define SUBTUNE_BW_BACKOFF          0.7f    // BW is lowered by this if the check finds overshoot
+#define SUBTUNE_BW_BACKOFFS         2       // at most this many times per axis
 
 const AP_Param::GroupInfo SubTune::var_info[] = {
     // @Param: STYLE
@@ -113,6 +121,13 @@ const AP_Param::GroupInfo SubTune::var_info[] = {
     // @Values: 0:Off,1:On
     // @User: Advanced
     AP_GROUPINFO("CHECK", 10, SubTune, check, 1),
+
+    // @Param: BW_AUTO
+    // @DisplayName: Model AutoTune response speed: fixed or calculated
+    // @Description: How the Model style (ATUN_STYLE 2) picks the response speed it designs the gains for. Fixed uses ATUN_BW on every axis. Calculated works it out for each axis from what the test measured, as the lowest of three limits: the lag (0.5/lag, about 60 degrees of phase margin), the gyro noise measured while the vehicle was still (noise times rate P under 2% of full output, so the thrusters don't chatter) and the thrust authority (a turn at ATUN_RATE needs under half the full output), between 1 and 15 rad/s; and if the check (ATUN_CHECK) refuses the new gains because they ran away or chattered it lowers BW by 30%, or because they overshot it halves rate I, and checks again, up to twice per axis. The Gentle style always uses ATUN_BW.
+    // @Values: 0:Fixed (ATUN_BW),1:Calculated
+    // @User: Advanced
+    AP_GROUPINFO("BW_AUTO", 11, SubTune, bw_auto, 1),
 
     AP_GROUPEND
 };
@@ -316,6 +331,13 @@ bool SubTune::init()
     settle_halvings = 0;
     ref_lag_sum = 0.0f;
     ref_lag_n = 0;
+    have_noise = false;
+    for (uint8_t k=0; k<3; k++) {
+        bw_backoffs[k] = 0;
+        i_scale[k] = 1.0f;
+        axis_bw[k] = bandwidth;
+        axis_bw_limit[k] = BWLimit::FIXED;
+    }
 
     if (!next_axis()) {
         GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "AutoTune: no axes selected in ATUN_AXES");
@@ -597,6 +619,12 @@ bool SubTune::next_axis()
 void SubTune::start_settle(uint32_t now_ms)
 {
     restore_axis_feedback();
+    const Vector3f &gyro = sub.ahrs.get_gyro();
+    for (uint8_t k=0; k<3; k++) {
+        noise_lp[k] = gyro[k];
+        noise_sq[k] = 0.0f;
+    }
+    noise_n = 0;
     step = Step::SETTLE;
     step_start_ms = now_ms;
     still_start_ms = now_ms;
@@ -645,12 +673,32 @@ void SubTune::update_settle(uint32_t now_ms)
                        fabsf(pitch) < radians(SUBTUNE_STILL_TILT_DEG) &&
                        fabsf(roll - still_roll_rad) < radians(SUBTUNE_STILL_DRIFT_DEG) &&
                        fabsf(pitch - still_pitch_rad) < radians(SUBTUNE_STILL_DRIFT_DEG);
+    // gyro noise while still: the gyro less its slow motion (below
+    // SUBTUNE_NOISE_HZ), per axis, as the rate controller sees it
+    const Vector3f &gyro = ahrs.get_gyro();
+    const float rate_hz = MAX(AP::scheduler().get_filtered_loop_rate_hz(), 50.0f);
+    const float alpha = constrain_float(M_2PI * SUBTUNE_NOISE_HZ / rate_hz, 0.0f, 1.0f);
+    for (uint8_t k=0; k<3; k++) {
+        noise_lp[k] += alpha * (gyro[k] - noise_lp[k]);
+        noise_sq[k] += sq(gyro[k] - noise_lp[k]);
+    }
+    noise_n++;
     if (!still) {
         still_start_ms = now_ms;
         still_roll_rad = roll;
         still_pitch_rad = pitch;
+        for (uint8_t k=0; k<3; k++) {
+            noise_sq[k] = 0.0f;
+        }
+        noise_n = 0;
     }
     if (now_ms - still_start_ms > SUBTUNE_STILL_MS) {
+        if (noise_n > 50) {
+            for (uint8_t k=0; k<3; k++) {
+                noise_rads[k] = sqrtf(noise_sq[k] / noise_n);
+            }
+            have_noise = true;
+        }
         start_excite(now_ms);
         return;
     }
@@ -1266,14 +1314,11 @@ void SubTune::finish_axis_model()
         // sine of amplitude W
         const float w_ref = radians(constrain_float(rate_dps, 5.0f, 45.0f));
         const float b_eq = MAX(b + 8.0f / (3.0f * M_PI) * MAX(b2, 0.0f) * w_ref, 0.0f);
-        const float omega = constrain_float(bandwidth, 1.0f, 15.0f);
-        tuned[i].rate_ff = constrain_float(b_eq / a, 0.0f, 2.0f);
-        tuned[i].rate_p = constrain_float(omega / a, 0.01f, 2.0f);
-        tuned[i].rate_i = constrain_float(0.25f * omega * tuned[i].rate_p, 0.0f, 2.0f);
-        tuned[i].angle_p = constrain_float((omega + b_eq) / 3.0f, 1.0f, 12.0f);
+        model_a[i] = a;
+        model_beq[i] = b_eq;
+        axis_bw[i] = choose_bw(i, a, lag_s);
+        design_gains(i);
         tuned[i].accel_radss = MAX(SUBTUNE_ACCEL_FRACTION * a, radians(10.0f));
-        // the gains above are designed without D
-        tuned[i].rate_d = 0.0f;
         have_tuned[i] = true;
         if (!lag_shared && axis != Axis::ROLL) {
             ref_lag_sum += lag_s;
@@ -1323,6 +1368,95 @@ void SubTune::finish_axis_model()
         return;
     }
     advance_axis();
+}
+
+const char *SubTune::bw_limit_name(BWLimit lim)
+{
+    switch (lim) {
+    case BWLimit::FIXED:  return "ATUN_BW";
+    case BWLimit::DELAY:  return "lag";
+    case BWLimit::NOISE:  return "gyro noise";
+    case BWLimit::THRUST: return "thrust";
+    case BWLimit::MIN:    return "minimum";
+    case BWLimit::MAX:    return "maximum";
+    }
+    return "";
+}
+
+/*
+  the response speed to design this axis's gains for: ATUN_BW, or with
+  ATUN_BW_AUTO the lowest of what the measured lag, gyro noise and thrust
+  authority allow. None of these depend on the starting gains, so neither
+  does the result.
+    lag:    the delay costs BW*lag radians of phase at the crossover; at
+            0.5/lag about 60 degrees of phase margin are left
+    noise:  the rate loop passes gyro noise to the thrusters times P = BW/a;
+            keep that under SUBTUNE_BW_NOISE_OUT of full output
+    thrust: P times a rate error of ATUN_RATE under SUBTUNE_BW_THRUST_OUT
+ */
+float SubTune::choose_bw(uint8_t i, float a, float lag_s)
+{
+    if (!bw_auto) {
+        axis_bw_limit[i] = BWLimit::FIXED;
+        return constrain_float(bandwidth, 1.0f, 15.0f);
+    }
+    float bw = SUBTUNE_BW_MAX;
+    BWLimit lim = BWLimit::MAX;
+    const float bw_delay = lag_s > 0.001f ? SUBTUNE_BW_DELAY / lag_s : SUBTUNE_BW_MAX * 10.0f;
+    const float noise = have_noise ? noise_rads[i] : 0.0f;
+    const float bw_noise = noise > 1.0e-5f ? SUBTUNE_BW_NOISE_OUT * a / noise : SUBTUNE_BW_MAX * 10.0f;
+    const float w_ref = radians(constrain_float(rate_dps, 5.0f, 45.0f));
+    const float bw_thrust = SUBTUNE_BW_THRUST_OUT * a / w_ref;
+    if (bw_delay < bw) {
+        bw = bw_delay;
+        lim = BWLimit::DELAY;
+    }
+    if (bw_noise < bw) {
+        bw = bw_noise;
+        lim = BWLimit::NOISE;
+    }
+    if (bw_thrust < bw) {
+        bw = bw_thrust;
+        lim = BWLimit::THRUST;
+    }
+    if (bw < SUBTUNE_BW_MIN) {
+        bw = SUBTUNE_BW_MIN;
+        lim = BWLimit::MIN;
+    }
+    axis_bw_limit[i] = lim;
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "AutoTune: %s BW %.1f (%s); lag %.0f noise %.0f thrust %.0f",
+                  axis_name(Axis(i)), double(bw), bw_limit_name(lim),
+                  double(MIN(bw_delay, 999.0f)), double(MIN(bw_noise, 999.0f)), double(MIN(bw_thrust, 999.0f)));
+#if HAL_LOGGING_ENABLED
+    // @LoggerMessage: SUBB
+    // @Description: Sub model AutoTune (ATUN_STYLE 2) response speed calculated for one axis (ATUN_BW_AUTO)
+    // @Field: TimeUS: Time since system startup
+    // @Field: Ax: axis, 0:roll, 1:pitch, 2:yaw
+    // @Field: BW: response speed chosen, rad/s
+    // @Field: Lim: what set it: 1:lag, 2:gyro noise, 3:thrust, 4:minimum, 5:maximum
+    // @Field: BWLag: what the lag allows
+    // @Field: BWNs: what the gyro noise allows
+    // @Field: BWThr: what the thrust authority allows
+    // @Field: Noise: gyro noise while still, rad/s RMS
+    // @Field: Lag: lag used
+    AP::logger().Write("SUBB", "TimeUS,Ax,BW,Lim,BWLag,BWNs,BWThr,Noise,Lag", "QBfBfffff",
+                       AP_HAL::micros64(), i, bw, uint8_t(lim), bw_delay, bw_noise, bw_thrust, noise, lag_s);
+#endif
+    return bw;
+}
+
+// the gains for this axis from its model and axis_bw
+void SubTune::design_gains(uint8_t i)
+{
+    const float a = model_a[i];
+    const float b_eq = model_beq[i];
+    const float omega = axis_bw[i];
+    tuned[i].rate_ff = constrain_float(b_eq / a, 0.0f, 2.0f);
+    tuned[i].rate_p = constrain_float(omega / a, 0.01f, 2.0f);
+    tuned[i].rate_i = constrain_float(0.25f * omega * tuned[i].rate_p * i_scale[i], 0.0f, 2.0f);
+    tuned[i].angle_p = constrain_float((omega + b_eq) / 3.0f, 1.0f, 12.0f);
+    // the gains above are designed without D
+    tuned[i].rate_d = 0.0f;
 }
 
 // this axis is finished: on to the next, or done
@@ -1590,6 +1724,39 @@ void SubTune::finish_check()
                            sc[set].settle_s, sc[set].chatter, uint8_t(sc[set].failed), uint8_t(keep_new));
     }
 #endif
+
+    // calculated BW: if the new gains lost for being too lively, adjust and
+    // check again. Running away or chattering means too fast for this
+    // vehicle's lag or noise: lower BW. Plain overshoot comes from the rate
+    // integrator winding up during the move (seen on yaw, which has no
+    // buoyancy spring to keep the integrator busy; lowering BW makes it
+    // worse): halve rate I
+    const bool ran_or_chatter = n.failed ||
+                                n.chatter > MAX(SUBTUNE_CHECK_CHAT_RATIO * o.chatter, SUBTUNE_CHECK_CHAT_FLOOR);
+    const bool overshoot = n.overshoot > MAX(o.overshoot + SUBTUNE_CHECK_OS_MARGIN, SUBTUNE_CHECK_OS_FLOOR);
+    if (bw_auto && !keep_new && (ran_or_chatter || overshoot) && bw_backoffs[i] < SUBTUNE_BW_BACKOFFS &&
+        (!ran_or_chatter || axis_bw[i] * SUBTUNE_BW_BACKOFF >= SUBTUNE_BW_MIN)) {
+        bw_backoffs[i]++;
+        if (ran_or_chatter) {
+            axis_bw[i] *= SUBTUNE_BW_BACKOFF;
+        } else {
+            i_scale[i] *= 0.5f;
+        }
+        const Gains keep_accel = tuned[i];
+        design_gains(i);
+        tuned[i].accel_radss = keep_accel.accel_radss;
+        if (ran_or_chatter) {
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "AutoTune: %s BW lowered to %.1f, checking again", axis_name(axis), double(axis_bw[i]));
+        } else {
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "AutoTune: %s overshoot: rate I halved, checking again", axis_name(axis));
+        }
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "AutoTune: %s P:%.3f I:%.3f FF:%.3f AngP:%.2f Accel:%.0f",
+                      axis_name(axis), double(tuned[i].rate_p), double(tuned[i].rate_i), double(tuned[i].rate_ff),
+                      double(tuned[i].angle_p), double(degrees(tuned[i].accel_radss)));
+        set_gains(axis, check_saved);
+        start_check(AP_HAL::millis());
+        return;
+    }
 
     if (!keep_new) {
         tuned[i] = orig[i];
