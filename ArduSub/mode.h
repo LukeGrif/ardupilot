@@ -607,7 +607,7 @@ public:
 
 private:
     enum class Axis : uint8_t { ROLL = 0, PITCH = 1, YAW = 2 };
-    enum class Step : uint8_t { SETTLE, EXCITE, DONE };
+    enum class Step : uint8_t { SETTLE, EXCITE, CHECK, DONE };
 
     struct Gains {
         float rate_p, rate_i, rate_d, rate_ff;
@@ -624,6 +624,7 @@ private:
     AP_Int8 diag;
     AP_Float rate_dps;
     AP_Float inj_max;
+    AP_Int8 check;
 
     Step step;
     Axis axis;
@@ -687,6 +688,38 @@ private:
     float model_dt;               // measured loop period for the model fit, s
     float ref_lag_sum;            // lags found on pitch and yaw, s: roll uses their mean
     uint8_t ref_lag_n;
+
+    // check after each model axis (ATUN_CHECK): the same angle steps flown
+    // with the original and the new gains, in the order old, new, new, old;
+    // the new gains are kept unless they do clearly worse
+    static constexpr uint8_t CHECK_RUNS = 4;
+    struct CheckRun {
+        float err_sq;           // squared angle error to the commanded step, summed
+        uint32_t err_n;
+        float overshoot;        // largest overshoot past a step's target, fraction of the step
+        float settle_s;         // settling time summed over the steps
+        uint8_t settle_n;
+        float chat_sq;          // high-passed rate output squared, summed (thruster chatter)
+        uint32_t chat_n;
+        bool failed;            // stopped: the error ran away (oscillation)
+    } check_res[CHECK_RUNS];
+    Gains check_saved;          // the axis's gains before the check
+    uint8_t check_run;
+    uint8_t check_seg;          // which step of the run, 0..3; 255 in the lead-in
+    uint32_t check_run_ms;      // start of the run
+    uint32_t check_seg_ms;      // start of the current step
+    uint32_t check_out_ms;      // last time the error was outside the tolerance
+    float check_seg_peak;       // largest overshoot in the current step, rad
+    float check_lp;             // low-passed rate output, for the chatter
+    float check_alpha;
+    float check_hold_yaw_rad;
+
+    void start_check(uint32_t now_ms);
+    void start_check_run(uint32_t now_ms);
+    void update_check(uint32_t now_ms);
+    void end_check_segment(uint32_t now_ms);
+    void finish_check();
+    void advance_axis();
 
     void reset_model();
     void weaken_axis_feedback();

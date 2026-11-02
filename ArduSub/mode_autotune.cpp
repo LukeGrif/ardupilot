@@ -79,7 +79,7 @@ const AP_Param::GroupInfo SubTune::var_info[] = {
 
     // @Param: BW
     // @DisplayName: Gentle AutoTune response speed
-    // @Description: Rate controller response speed the gentle AutoTune style designs the gains for. Higher values give faster, more aggressive gains. The test cannot measure thruster spin-up lag, so lower this if the vehicle oscillates on the tuned gains.
+    // @Description: Rate controller response speed the Gentle and Model AutoTune styles design the gains for. Higher values give faster, more aggressive gains. The Gentle style cannot measure thruster spin-up lag, so lower this if the vehicle oscillates on its tuned gains. The Model style measures the lag (reported as lag=..ms); keeping this below about 0.5/lag leaves roughly 60 degrees of phase margin, and its check (ATUN_CHECK) refuses gains that fly worse than the original ones.
     // @Units: rad/s
     // @Range: 1 15
     // @User: Advanced
@@ -106,6 +106,13 @@ const AP_Param::GroupInfo SubTune::var_info[] = {
     // @Range: 0.05 0.8
     // @User: Advanced
     AP_GROUPINFO("INJ_MAX", 9, SubTune, inj_max, 0.4f),
+
+    // @Param: CHECK
+    // @DisplayName: Model AutoTune check of the new gains
+    // @Description: After each axis the Model style (ATUN_STYLE 2) flies the same angle steps (+10, 0, -10, 0 degrees, 2 s each) with the original and with the new gains, in the order old, new, new, old (about 40 s per axis), and keeps the new gains unless they do clearly worse: a run stopped because the error ran away (oscillation), overshoot more than 5 points above the original's and above 15%, angle error over 1.25 times the original's, or thruster chatter over twice the original's. Reports both sets' overshoot, settling time, error and chatter, and logs SUBC.
+    // @Values: 0:Off,1:On
+    // @User: Advanced
+    AP_GROUPINFO("CHECK", 10, SubTune, check, 1),
 
     AP_GROUPEND
 };
@@ -344,6 +351,9 @@ void SubTune::run()
         if (!pilot_override && step != Step::DONE) {
             // fly on the original gains while the pilot is in control
             restore_axis_feedback();
+            if (step == Step::CHECK) {
+                set_gains(axis, check_saved);
+            }
             pilot_override = true;
             GCS_SEND_TEXT(MAV_SEVERITY_INFO, "AutoTune: pilot override, paused");
         }
@@ -354,7 +364,12 @@ void SubTune::run()
             // restart the current axis
             pilot_override = false;
             GCS_SEND_TEXT(MAV_SEVERITY_INFO, "AutoTune: resuming %s", axis_name(axis));
-            start_settle(now_ms);
+            if (step == Step::CHECK) {
+                // the check starts again; the model is kept
+                start_check(now_ms);
+            } else {
+                start_settle(now_ms);
+            }
         }
         switch (step) {
         case Step::SETTLE:
@@ -362,6 +377,9 @@ void SubTune::run()
             break;
         case Step::EXCITE:
             update_excite(now_ms);
+            break;
+        case Step::CHECK:
+            update_check(now_ms);
             break;
         case Step::DONE:
             attitude_control.input_euler_angle_roll_pitch_yaw_rad(0.0f, 0.0f, hold_yaw_rad, true);
@@ -387,6 +405,10 @@ void SubTune::run()
 void SubTune::stop()
 {
     restore_axis_feedback();
+    if (step == Step::CHECK) {
+        set_gains(axis, check_saved);
+        step = Step::SETTLE;
+    }
     restore_untuned();
     if (tuned_loaded) {
         load_gains(false);
@@ -850,17 +872,7 @@ void SubTune::finish_axis()
                        tuned[i].rate_p, tuned[i].rate_i, tuned[i].rate_ff, tuned[i].angle_p);
 #endif
 
-    axis_done[i] = true;
-    const uint32_t now_ms = AP_HAL::millis();
-    if (next_axis()) {
-        start_settle(now_ms);
-        return;
-    }
-
-    step = Step::DONE;
-    restore_untuned();
-    load_gains(true);
-    GCS_SEND_TEXT(MAV_SEVERITY_NOTICE, "AutoTune: Success");
+    advance_axis();
 }
 
 /*
@@ -1306,7 +1318,17 @@ void SubTune::finish_axis_model()
                        tuned[i].rate_p, tuned[i].rate_i, tuned[i].rate_ff, tuned[i].angle_p);
 #endif
 
-    axis_done[i] = true;
+    if (have_tuned[i] && check) {
+        start_check(AP_HAL::millis());
+        return;
+    }
+    advance_axis();
+}
+
+// this axis is finished: on to the next, or done
+void SubTune::advance_axis()
+{
+    axis_done[uint8_t(axis)] = true;
     const uint32_t now_ms = AP_HAL::millis();
     if (next_axis()) {
         start_settle(now_ms);
@@ -1317,6 +1339,264 @@ void SubTune::finish_axis_model()
     restore_untuned();
     load_gains(true);
     GCS_SEND_TEXT(MAV_SEVERITY_NOTICE, "AutoTune: Success");
+}
+
+/*
+  check of the new gains (ATUN_CHECK), model style: fly the same angle steps
+  with the original and the new gains on this axis and keep the new ones
+  unless they do clearly worse. The order old, new, new, old cancels a slow
+  drift in the conditions (current, tether). Each run holds level for
+  SUBTUNE_CHECK_LEAD_MS, then steps to +A, 0, -A and 0, SUBTUNE_CHECK_HOLD_MS
+  each, through the attitude controller as the pilot's input would go (input
+  shaping with the accel limit, angle P, rate loop: the whole set is checked).
+  Measured on the axis's angle against the commanded step:
+    error     RMS error over the steps
+    overshoot largest excursion past a step's target, fraction of the step
+    settle    time until the error stays inside SUBTUNE_CHECK_TOL_DEG
+    chatter   RMS of the rate output above SUBTUNE_CHECK_CHAT_HZ: thruster
+              jitter that doesn't move the vehicle
+  It is a guard, not a search: the new gains are designed from the model, and
+  are only refused when the vehicle shows they are clearly worse.
+ */
+#define SUBTUNE_CHECK_STEP_DEG      10.0f   // size of the check steps
+#define SUBTUNE_CHECK_LEAD_MS       2000    // level hold before each run
+#define SUBTUNE_CHECK_HOLD_MS       2000    // time on each step
+#define SUBTUNE_CHECK_TOL_DEG       1.0f    // settled when the error stays inside this
+#define SUBTUNE_CHECK_ABORT         2.5f    // error above this many steps stops the run (oscillation)
+#define SUBTUNE_CHECK_TILT_DEG      35.0f   // roll or pitch above this stops the run
+#define SUBTUNE_CHECK_CHAT_HZ       2.0f    // chatter is the rate output above this frequency
+#define SUBTUNE_CHECK_OS_MARGIN     0.05f   // new overshoot may exceed the original's by this
+#define SUBTUNE_CHECK_OS_FLOOR      0.15f   // and is always accepted below this
+#define SUBTUNE_CHECK_ERR_RATIO     1.25f   // new RMS error may be this much above the original's
+#define SUBTUNE_CHECK_CHAT_RATIO    2.0f    // new chatter may be this much above the original's
+#define SUBTUNE_CHECK_CHAT_FLOOR    0.02f   // and is always accepted below this (fraction of full output)
+
+static const float check_targets[4] { 1.0f, 0.0f, -1.0f, 0.0f };
+
+// old gains in runs 0 and 3, new in 1 and 2
+static bool check_run_new(uint8_t run) { return run == 1 || run == 2; }
+
+void SubTune::start_check(uint32_t now_ms)
+{
+    step = Step::CHECK;
+    check_saved = get_gains(axis);
+    check_hold_yaw_rad = hold_yaw_rad;
+    const float rate_hz = MAX(AP::scheduler().get_filtered_loop_rate_hz(), 50.0f);
+    check_alpha = constrain_float(M_2PI * SUBTUNE_CHECK_CHAT_HZ / rate_hz, 0.0f, 1.0f);
+    memset(check_res, 0, sizeof(check_res));
+    check_run = 0;
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "AutoTune: %s check: old vs new gains, %.0fs", axis_name(axis),
+                  double(CHECK_RUNS * (SUBTUNE_CHECK_LEAD_MS + 4 * SUBTUNE_CHECK_HOLD_MS) * 0.001f));
+    start_check_run(now_ms);
+}
+
+void SubTune::start_check_run(uint32_t now_ms)
+{
+    const uint8_t i = uint8_t(axis);
+    set_gains(axis, check_run_new(check_run) ? tuned[i] : orig[i]);
+    check_run_ms = now_ms;
+    check_seg = 255;
+    check_lp = 0.0f;
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "AutoTune: %s check %u/%u (%s gains)", axis_name(axis),
+                  unsigned(check_run + 1), unsigned(CHECK_RUNS), check_run_new(check_run) ? "new" : "old");
+}
+
+// the step that just ended: its overshoot and settling time
+void SubTune::end_check_segment(uint32_t now_ms)
+{
+    CheckRun &r = check_res[check_run];
+    const float step_rad = radians(SUBTUNE_CHECK_STEP_DEG);
+    r.overshoot = MAX(r.overshoot, check_seg_peak / step_rad);
+    float settle_s;
+    if (check_out_ms == check_seg_ms) {
+        // inside the tolerance from the start
+        settle_s = 0.0f;
+    } else if (now_ms - check_out_ms < 300) {
+        // still outside near the end: not settled, count the whole step
+        settle_s = (now_ms - check_seg_ms) * 0.001f;
+    } else {
+        settle_s = (check_out_ms - check_seg_ms) * 0.001f;
+    }
+    r.settle_s += settle_s;
+    r.settle_n++;
+}
+
+void SubTune::update_check(uint32_t now_ms)
+{
+    const AP_AHRS &ahrs = sub.ahrs;
+    const float step_rad = radians(SUBTUNE_CHECK_STEP_DEG);
+    const uint32_t t_ms = now_ms - check_run_ms;
+
+    // which step of the run
+    uint8_t seg = 255;
+    if (t_ms >= SUBTUNE_CHECK_LEAD_MS) {
+        seg = MIN((t_ms - SUBTUNE_CHECK_LEAD_MS) / SUBTUNE_CHECK_HOLD_MS, 4U);
+    }
+    if (seg != check_seg) {
+        if (check_seg != 255) {
+            end_check_segment(now_ms);
+        }
+        if (seg >= 4) {
+            // run complete
+            check_run++;
+            if (check_run >= CHECK_RUNS) {
+                finish_check();
+                return;
+            }
+            start_check_run(now_ms);
+            seg = 255;
+        } else {
+            check_seg_ms = now_ms;
+            check_out_ms = now_ms;
+            check_seg_peak = 0.0f;
+        }
+        check_seg = seg;
+    }
+    CheckRun &r = check_res[check_run];
+
+    // command the step through the attitude controller
+    const float target = seg == 255 ? 0.0f : check_targets[seg] * step_rad;
+    float roll_t = 0.0f, pitch_t = 0.0f, yaw_t = check_hold_yaw_rad;
+    float angle = 0.0f;
+    float u = 0.0f;
+    switch (axis) {
+    case Axis::ROLL:
+        roll_t = target;
+        angle = ahrs.get_roll_rad();
+        u = sub.motors.get_roll() + sub.motors.get_roll_ff();
+        break;
+    case Axis::PITCH:
+        pitch_t = target;
+        angle = ahrs.get_pitch_rad();
+        u = sub.motors.get_pitch() + sub.motors.get_pitch_ff();
+        break;
+    case Axis::YAW:
+        yaw_t = wrap_PI(check_hold_yaw_rad + target);
+        angle = wrap_PI(ahrs.get_yaw_rad() - check_hold_yaw_rad);
+        u = sub.motors.get_yaw() + sub.motors.get_yaw_ff();
+        break;
+    }
+    sub.attitude_control.input_euler_angle_roll_pitch_yaw_rad(roll_t, pitch_t, yaw_t, true);
+
+    const float err = wrap_PI(angle - target);
+    check_lp += check_alpha * (u - check_lp);
+
+    // runaway: stop this run; the next starts with its own gains after the lead-in
+    if (fabsf(err) > SUBTUNE_CHECK_ABORT * step_rad ||
+        fabsf(ahrs.get_roll_rad()) > radians(SUBTUNE_CHECK_TILT_DEG) ||
+        fabsf(ahrs.get_pitch_rad()) > radians(SUBTUNE_CHECK_TILT_DEG)) {
+        r.failed = true;
+        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "AutoTune: %s check %u: error ran away, stopped",
+                      axis_name(axis), unsigned(check_run + 1));
+        check_run++;
+        if (check_run >= CHECK_RUNS) {
+            finish_check();
+            return;
+        }
+        start_check_run(now_ms);
+        return;
+    }
+
+    if (seg == 255) {
+        return;
+    }
+    r.err_sq += sq(err);
+    r.err_n++;
+    r.chat_sq += sq(u - check_lp);
+    r.chat_n++;
+    // past the target in the direction of the step
+    const float dir = check_targets[seg] - (seg == 0 ? 0.0f : check_targets[seg - 1]);
+    check_seg_peak = MAX(check_seg_peak, dir > 0 ? err : -err);
+    if (fabsf(err) > radians(SUBTUNE_CHECK_TOL_DEG)) {
+        check_out_ms = now_ms;
+    }
+}
+
+void SubTune::finish_check()
+{
+    const uint8_t i = uint8_t(axis);
+
+    // the two runs of each set together: [0] original gains, [1] new
+    struct Score { float err_deg, overshoot, settle_s, chatter; bool failed; } sc[2] {};
+    for (uint8_t set=0; set<2; set++) {
+        float err_sq = 0, chat_sq = 0, settle = 0, os = 0;
+        uint32_t err_n = 0, chat_n = 0, settle_n = 0, runs = 0;
+        bool failed = false;
+        for (uint8_t run=0; run<CHECK_RUNS; run++) {
+            if (check_run_new(run) != (set == 1)) {
+                continue;
+            }
+            const CheckRun &r = check_res[run];
+            failed |= r.failed;
+            err_sq += r.err_sq;
+            err_n += r.err_n;
+            chat_sq += r.chat_sq;
+            chat_n += r.chat_n;
+            settle += r.settle_s;
+            settle_n += r.settle_n;
+            os += r.overshoot;
+            runs++;
+        }
+        sc[set].failed = failed;
+        sc[set].err_deg = err_n ? degrees(sqrtf(err_sq / err_n)) : 0.0f;
+        sc[set].chatter = chat_n ? sqrtf(chat_sq / chat_n) : 0.0f;
+        sc[set].settle_s = settle_n ? settle / settle_n : 0.0f;
+        sc[set].overshoot = runs ? os / runs : 0.0f;
+    }
+    const Score &o = sc[0], &n = sc[1];
+
+    // keep the new gains unless they do clearly worse
+    const char *why = nullptr;
+    if (n.failed) {
+        why = "new gains ran away";
+    } else if (o.failed) {
+        // the original gains ran away: anything that didn't is better
+    } else if (n.overshoot > MAX(o.overshoot + SUBTUNE_CHECK_OS_MARGIN, SUBTUNE_CHECK_OS_FLOOR)) {
+        why = "more overshoot";
+    } else if (n.err_deg > SUBTUNE_CHECK_ERR_RATIO * o.err_deg) {
+        why = "larger error";
+    } else if (n.chatter > MAX(SUBTUNE_CHECK_CHAT_RATIO * o.chatter, SUBTUNE_CHECK_CHAT_FLOOR)) {
+        why = "more thruster chatter";
+    }
+    const bool keep_new = why == nullptr;
+
+    if (keep_new) {
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "AutoTune: %s check: new gains kept", axis_name(axis));
+    } else {
+        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "AutoTune: %s check: OLD gains kept, %s", axis_name(axis), why);
+    }
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "AutoTune: %s new/old: overshoot %.0f/%.0f%% settle %.1f/%.1fs",
+                  axis_name(axis), double(100.0f * n.overshoot), double(100.0f * o.overshoot),
+                  double(n.settle_s), double(o.settle_s));
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "AutoTune: %s new/old: error %.1f/%.1fdeg chatter %.3f/%.3f%s",
+                  axis_name(axis), double(n.err_deg), double(o.err_deg), double(n.chatter), double(o.chatter),
+                  o.failed ? " old ran away" : "");
+
+#if HAL_LOGGING_ENABLED
+    // @LoggerMessage: SUBC
+    // @Description: Sub model AutoTune (ATUN_STYLE 2) check of the new gains against the original ones, one row per set
+    // @Field: TimeUS: Time since system startup
+    // @Field: Ax: axis, 0:roll, 1:pitch, 2:yaw
+    // @Field: New: 0: original gains, 1: new gains
+    // @Field: Err: RMS angle error to the commanded steps
+    // @Field: OS: overshoot, fraction of the step
+    // @Field: Set: mean settling time
+    // @Field: Chat: RMS of the rate output above 2 Hz
+    // @Field: Fail: 1 if a run was stopped because the error ran away
+    // @Field: Kept: 1 if the new gains were kept
+    for (uint8_t set=0; set<2; set++) {
+        AP::logger().Write("SUBC", "TimeUS,Ax,New,Err,OS,Set,Chat,Fail,Kept", "QBBffffBB",
+                           AP_HAL::micros64(), i, set, sc[set].err_deg, sc[set].overshoot,
+                           sc[set].settle_s, sc[set].chatter, uint8_t(sc[set].failed), uint8_t(keep_new));
+    }
+#endif
+
+    if (!keep_new) {
+        tuned[i] = orig[i];
+    }
+    // back to the gains it had before the check for the rest of the tune
+    set_gains(axis, check_saved);
+    advance_axis();
 }
 
 /*

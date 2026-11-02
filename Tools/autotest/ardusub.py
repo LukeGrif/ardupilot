@@ -725,6 +725,9 @@ class AutoTestSub(vehicle_test_suite.TestSuite):
             "MOT_SPIN_MAX": 1.0,
             "MOT_THST_EXPO": 1.0,
             "ATUN_STYLE": 2,
+            # the check can rightly keep starting gains that fly better than
+            # the model's; this test is about the model's gains
+            "ATUN_CHECK": 0,
         })
         defaults = {
             "ATC_RAT_RLL_P": 0.135, "ATC_RAT_RLL_I": 0.09, "ATC_ANG_RLL_P": 6.0,
@@ -765,6 +768,67 @@ class AutoTestSub(vehicle_test_suite.TestSuite):
             self.progress("%s: %.4f (from x0.5) %.4f (from x2)" % (name, a, b))
             if max(a, b) / min(a, b) > 1.15:
                 raise NotAchievedException("%s depends on the starting gains: %.4f vs %.4f" % (name, a, b))
+
+    def AutoTuneModelCheck(self):
+        """Test the model AUTOTUNE style's check of the new gains (ATUN_CHECK): it keeps them over starting gains that are far too weak or that oscillate"""
+        self.customise_SITL_commandline(
+            [],
+            model="vectored_6dof",
+            defaults_filepath=self.model_defaults_filepath("vectored_6dof"),
+            wipe=True,
+        )
+        self.set_parameters({
+            "MOT_THST_LIN": 1,
+            "MOT_SPIN_MIN": 0,
+            "MOT_SPIN_MAX": 1.0,
+            "MOT_THST_EXPO": 1.0,
+            "ATUN_STYLE": 2,
+            "ATUN_CHECK": 1,
+        })
+        defaults = {
+            "ATC_RAT_RLL_P": 0.135, "ATC_RAT_RLL_I": 0.09, "ATC_ANG_RLL_P": 6.0,
+            "ATC_RAT_PIT_P": 0.135, "ATC_RAT_PIT_I": 0.09, "ATC_ANG_PIT_P": 6.0,
+            "ATC_RAT_YAW_P": 0.18, "ATC_RAT_YAW_I": 0.018, "ATC_ANG_YAW_P": 6.0,
+        }
+        verdicts = []
+
+        def hook(mav, m):
+            if m.get_type() != 'STATUSTEXT':
+                return
+            if " check: " in m.text and "gains kept" in m.text:
+                verdicts.append(m.text)
+            if " check: " in m.text or "new/old" in m.text or "ran away" in m.text or " P:" in m.text:
+                self.progress(m.text)
+        self.install_message_hook_context(hook)
+
+        # 0.1: far too weak; 3: oscillates with the linearised thrusters.
+        # Either way the model's gains must fly better and be kept. 0.5 is
+        # reported only: the starting gains may rightly win there.
+        for factor, must_keep_new in (0.1, True), (3.0, True), (0.5, False):
+            self.progress("Tuning from %.1fx the default gains" % factor)
+            self.set_parameters({k: v * factor for k, v in defaults.items()})
+            verdicts.clear()
+            self.context_collect('STATUSTEXT')
+            self.change_mode('ALT_HOLD')
+            self.wait_ready_to_arm()
+            self.arm_vehicle()
+            self.set_rc(Joystick.Throttle, 1300)
+            self.wait_altitude(altitude_min=-8, altitude_max=-6)
+            self.set_rc(Joystick.Throttle, 1500)
+            self.delay_sim_time(3)
+            tstart = self.get_sim_time()
+            self.change_mode(15)  # AUTOTUNE
+            self.wait_statustext("AutoTune: Success", timeout=900, check_context=True)
+            self.progress("AUTOTUNE OK (%u seconds)" % (self.get_sim_time() - tstart))
+            # disarming in AUTOTUNE saves and lets the next tune start afresh;
+            # the next start's gains are set above
+            self.disarm_vehicle()
+            self.wait_statustext("AutoTune: Saved gains", check_context=True)
+            self.context_clear_collection('STATUSTEXT')
+            if len(verdicts) != 3:
+                raise NotAchievedException("expected 3 check results, got %s" % verdicts)
+            if must_keep_new and any("OLD gains kept" in v for v in verdicts):
+                raise NotAchievedException("from %.1fx the check kept the starting gains: %s" % (factor, verdicts))
 
     def MotorThrustHoverParameterIgnore(self):
         """Test if we are ignoring MOT_THST_HOVER parameter"""
@@ -1506,6 +1570,7 @@ class AutoTestSub(vehicle_test_suite.TestSuite):
             self.AutoTune,
             self.AutoTuneGentle,
             self.AutoTuneModel,
+            self.AutoTuneModelCheck,
             self.ModeChanges,
             self.MAV_mgs,
             self.DiveMission,
