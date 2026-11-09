@@ -138,7 +138,7 @@ bool ModeDynamic::dynamic_set_destination(const Vector3f& destination)
     set_vertical_target(SubMode::POSITION, -destination.z * 0.01 - position_control->get_pos_terrain_D_m(), 0.0f);
 
 #if HAL_LOGGING_ENABLED
-    sub.Log_Write_GuidedTarget(uint8_t(horiz_submode), destination, Vector3f());
+    sub.Log_Write_GuidedTarget(uint8_t(horiz_submode), destination, Vector3f(), Vector3f());
 #endif
 
     return true;
@@ -198,7 +198,7 @@ bool ModeDynamic::dynamic_set_destination_posvel(const Vector3f& destination, co
     set_vertical_target(SubMode::POSVEL, -destination.z * 0.01 - position_control->get_pos_terrain_D_m(), -velocity.z * 0.01);
 
 #if HAL_LOGGING_ENABLED
-    sub.Log_Write_GuidedTarget(uint8_t(horiz_submode), destination, velocity);
+    sub.Log_Write_GuidedTarget(uint8_t(horiz_submode), destination, velocity, Vector3f());
 #endif
 
     return true;
